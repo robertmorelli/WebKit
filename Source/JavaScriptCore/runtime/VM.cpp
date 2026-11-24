@@ -29,6 +29,9 @@
 #include "config.h"
 #include "VM.h"
 
+#include "TierUpTimeAttribution.h"
+#include "TierUpExperts.h"
+
 #include "AbortReason.h"
 #include "AccessCase.h"
 #include "AggregateError.h"
@@ -516,6 +519,13 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
     }
 #endif // ENABLE(SAMPLING_PROFILER)
 
+    if (TierUpTimeAttribution::isEnabled()) [[unlikely]]
+        TierUpTimeAttribution::start(*this);
+#if ENABLE(DFG_JIT)
+    if (Options::tierUpExpert() || Options::deoptExpert()) [[unlikely]]
+        TierUpExperts::initialize(*this);
+#endif
+
     if (Options::useRandomizingFuzzerAgent())
         setFuzzerAgent(makeUnique<RandomizingFuzzerAgent>(*this));
     if (Options::useDoublePredictionFuzzerAgent())
@@ -630,6 +640,13 @@ VM::~VM()
         m_samplingProfiler->shutdown();
     }
 #endif // ENABLE(SAMPLING_PROFILER)
+
+    if (TierUpTimeAttribution::isEnabled()) [[unlikely]]
+        TierUpTimeAttribution::stop(*this);
+#if ENABLE(DFG_JIT)
+    if (TierUpExperts::enabled()) [[unlikely]]
+        TierUpExperts::shutdown(*this);
+#endif
     
 #if ENABLE(JIT)
     if (JITWorklist* worklist = JITWorklist::existingGlobalWorklistOrNull())

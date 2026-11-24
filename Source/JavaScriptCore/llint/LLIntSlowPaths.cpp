@@ -75,6 +75,9 @@
 #include "SymbolTableInlines.h"
 #include "VMInlines.h"
 #include "VMTrapsInlines.h"
+#include "TierUpOracle.h"
+#include "TierUpExperts.h"
+#include "MinutemanCallSiteProfile.h"
 #include <wtf/NeverDestroyed.h>
 #include <wtf/StringPrintStream.h>
 
@@ -280,6 +283,18 @@ extern "C" UGPRPair SYSV_ABI llint_trace_value(CallFrame* callFrame, const JSIns
     LLINT_END_IMPL();
 }
 
+// minuteman prototype: per-call-site argument type profiling (called from the LLInt call
+// opcodes only in builds with ENABLE_MINUTEMAN_CALLSITE_PROFILING; a no-op otherwise).
+LLINT_SLOW_PATH_DECL(slow_path_minuteman_profile_call)
+{
+    LLINT_BEGIN_NO_SET_PC();
+    UNUSED_PARAM(globalObject);
+    UNUSED_VARIABLE(throwScope);
+    UNUSED_VARIABLE(vm);
+    MinutemanCallSiteProfile::record(callFrame, codeBlock, pc);
+    LLINT_END_IMPL();
+}
+
 LLINT_SLOW_PATH_DECL(trace_prologue)
 {
     if (!Options::traceLLIntExecution())
@@ -370,6 +385,8 @@ static FunctionAllowlist& ensureGlobalJITAllowlist()
 
 static inline bool shouldJIT(CodeBlock* codeBlock)
 {
+    if (TierUpOracle::isEnabled() && TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::Baseline) == TierUpOracle::Never) [[unlikely]]
+        return false;
     if (!Options::bytecodeRangeToJITCompile().isInRange(codeBlock->instructionsSize())
         || !ensureGlobalJITAllowlist().contains(codeBlock))
         return false;
@@ -396,11 +413,17 @@ static inline bool jitCompileAndSetHeuristics(VM& vm, CodeBlock* codeBlock)
     if (codeBlock->jitType() != JITType::BaselineJIT && installSharedBaselineCode())
         return true;
 
-    if (!codeBlock->checkIfJITThresholdReached()) {
+    bool reached = codeBlock->checkIfJITThresholdReached();
+    if (TierUpExperts::enabled()) [[unlikely]]
+        reached = TierUpExperts::tierUp(TierUpExperts::DP::LLIntToBaseline, codeBlock, reached);
+    if (!reached) {
         CODEBLOCK_LOG_EVENT(codeBlock, "delayJITCompile", ("threshold not reached, counter = ", codeBlock->llintExecuteCounter()));
         dataLogLnIf(Options::verboseOSR(), "    JIT threshold should be lifted.");
         return false;
     }
+
+    if (TierUpOracle::isEnabled()) [[unlikely]]
+        TierUpOracle::logTrigger(codeBlock, TierUpOracle::Tier::Baseline, codeBlock->llintExecuteCounter().count());
 
     // Must precede the worklist query so that a plan becoming ready afterwards can still force the slow path. finalize() overrides it.
     codeBlock->jitSoon();

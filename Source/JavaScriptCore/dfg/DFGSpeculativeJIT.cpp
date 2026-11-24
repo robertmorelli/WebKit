@@ -26,6 +26,8 @@
 #include "config.h"
 #include "DFGSpeculativeJIT.h"
 
+#include "TierUpExperts.h"
+
 WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 
 #if ENABLE(DFG_JIT)
@@ -2019,6 +2021,8 @@ void SpeculativeJIT::noticeOSRBirth(Node* node)
 
 void SpeculativeJIT::compileLoopHint(Node* node)
 {
+    if (TierUpExperts::enabled()) [[unlikely]]
+        add64(TrustedImm32(1), AbsoluteAddress(TierUpExperts::workCounterFor(m_graph.m_codeBlock, false)));
     if (Options::returnEarlyFromInfiniteLoopsForFuzzing()) [[unlikely]] {
         bool emitEarlyReturn = true;
         node->origin.semantic.walkUpInlineStack([&](CodeOrigin origin) {

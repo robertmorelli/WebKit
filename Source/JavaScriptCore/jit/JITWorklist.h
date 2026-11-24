@@ -57,6 +57,9 @@ public:
 
     CompilationResult enqueue(Ref<JITPlan>);
     size_t queueLength() const;
+    // minuteman: compile slots of `tier` neither running a plan nor claimed by a queued plan
+    // (negative when plans are waiting). Used by the queue-slack tier-up expert.
+    int64_t idleCapacity(JITPlan::Tier) const;
 
     void suspendAllThreads();
     void resumeAllThreads();

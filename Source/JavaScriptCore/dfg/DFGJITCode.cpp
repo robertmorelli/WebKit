@@ -32,6 +32,8 @@
 #include "FTLForOSREntryJITCode.h"
 #include "JumpTable.h"
 #include "TierUpOverride.h"
+#include "TierUpPolicy.h"
+#include "TierUpOracle.h"
 
 namespace JSC { namespace DFG {
 
@@ -344,6 +346,17 @@ void JITCode::dontOptimizeAnytimeSoon(CodeBlock* codeBlock)
 void JITCode::optimizeAfterWarmUp(CodeBlock* codeBlock)
 {
     ASSERT(codeBlock->jitType() == JITType::DFGJIT);
+    if (TierUpOracle::isEnabled()) [[unlikely]] {
+        int64_t n = TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::FTL);
+        if (n == TierUpOracle::Never) {
+            dontOptimizeAnytimeSoon(codeBlock);
+            return;
+        }
+        if (n != TierUpOracle::Default) {
+            codeBlock->dfgJITData()->tierUpCounter().setNewThreshold(TierUpOracle::clampCount(n), nullptr);
+            return;
+        }
+    }
     dataLogLnIf(Options::verboseOSR(), *codeBlock, ": FTL-optimizing after warm-up.");
     CodeBlock* baseline = codeBlock->baselineVersion();
     int32_t threshold = Options::thresholdForFTLOptimizeAfterWarmUp();
@@ -353,6 +366,8 @@ void JITCode::optimizeAfterWarmUp(CodeBlock* codeBlock)
     }
     if (TierUpOverride::isEnabled()) [[unlikely]]
         threshold = TierUpOverride::adjustThreshold(baseline, TierUpOverride::Step::FTL, threshold);
+    if (TierUpPolicy::isEnabled()) [[unlikely]]
+        threshold = TierUpPolicy::adjustThreshold(baseline, TierUpPolicy::Step::FTL, threshold);
     codeBlock->dfgJITData()->tierUpCounter().setNewThreshold(baseline->adjustedCounterValue(threshold), baseline);
 }
 
@@ -364,6 +379,8 @@ void JITCode::optimizeSoon(CodeBlock* codeBlock)
     int32_t threshold = Options::thresholdForFTLOptimizeSoon();
     if (TierUpOverride::isEnabled()) [[unlikely]]
         threshold = TierUpOverride::adjustThreshold(baseline, TierUpOverride::Step::FTL, threshold);
+    if (TierUpPolicy::isEnabled()) [[unlikely]]
+        threshold = TierUpPolicy::adjustThreshold(baseline, TierUpPolicy::Step::FTL, threshold);
     codeBlock->dfgJITData()->tierUpCounter().setNewThreshold(baseline->adjustedCounterValue(threshold), codeBlock);
 }
 

@@ -88,6 +88,9 @@
 #include <wtf/StringPrintStream.h>
 #include <wtf/text/UniquedStringImpl.h>
 #include "TierUpOverride.h"
+#include "TierUpPolicy.h"
+#include "TierUpOracle.h"
+#include "TierUpExperts.h"
 
 #if ENABLE(ASSEMBLER)
 #include "RegisterAtOffsetList.h"
@@ -802,6 +805,14 @@ bool CodeBlock::finishCreation(VM& vm, ScriptExecutable* ownerExecutable, Unlink
     initializeTemplateObjects(topLevelExecutable, templateObjectIndices);
     RETURN_IF_EXCEPTION(throwScope, false);
 
+    if (TierUpOracle::isEnabled()) [[unlikely]] {
+        int64_t n = TierUpOracle::countFor(this, TierUpOracle::Tier::Baseline);
+        if (n == TierUpOracle::Never)
+            m_unlinkedCode->llintExecuteCounter().deferIndefinitely();
+        else if (n != TierUpOracle::Default)
+            m_unlinkedCode->llintExecuteCounter().setNewThreshold(TierUpOracle::clampCount(n), nullptr);
+    }
+
     if (TierUpOverride::isEnabled()) [[unlikely]] {
         int32_t threshold = Options::thresholdForJITAfterWarmUp();
         int32_t adjusted = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::Baseline, threshold);
@@ -876,6 +887,8 @@ void CodeBlock::setupWithUnlinkedBaselineCode(Ref<BaselineJITCode> jitCode)
 
 CodeBlock::~CodeBlock()
 {
+    if (TierUpExperts::enabled()) [[unlikely]]
+        TierUpExperts::forget(this);
     auto& cc = checker();
     if (cc.isEnabled) {
         RELEASE_ASSERT(cc.get(CrashChecker::This) == cc.hash(this),
@@ -2230,6 +2243,8 @@ void CodeBlock::linkIncomingCall(JSCell* caller, CallLinkInfoBase* incoming)
 {
     if (caller)
         noticeIncomingCall(caller);
+    if (caller && TierUpExperts::enabled()) [[unlikely]]
+        TierUpExperts::noteIncomingCall(this, caller);
     m_incomingCalls.push(incoming);
 }
 
@@ -2318,6 +2333,11 @@ void CodeBlock::jettison(Profiler::JettisonReason reason, ReoptimizationMode mod
     if (jitType() == JITType::FTLJIT)
         didFTLJettison(reason);
 #endif
+
+    if (TierUpPolicy::isEnabled()) [[unlikely]]
+        TierUpPolicy::noteJettison(this, reason);
+    if (TierUpOracle::isEnabled()) [[unlikely]]
+        TierUpOracle::logJettison(this, reason);
 
     CodeBlock* codeBlock = this; // Placate GCC for use in CODEBLOCK_LOG_EVENT  (does not like this).
     CODEBLOCK_LOG_EVENT(codeBlock, "jettison", ("due to ", reason, ", counting = ", mode == CountReoptimization, ", detail = ", pointerDump(detail)));
@@ -2423,6 +2443,9 @@ void CodeBlock::jettison(Profiler::JettisonReason reason, ReoptimizationMode mod
 
         if (reason != Profiler::JettisonDueToOldAge && reason != Profiler::JettisonDueToVMTraps)
             tallyFrequentExitSites();
+
+        if (TierUpExperts::enabled()) [[unlikely]]
+            TierUpExperts::noteJettison(this, reason); // after JSC's re-arm, which an expert may override
 #endif // ENABLE(DFG_JIT)
 
         // Jettison can happen during GC. We don't want to install code to a dead executable
@@ -2645,9 +2668,28 @@ void CodeBlock::dontOptimizeAnytimeSoon()
         jitData->executeCounter().deferIndefinitely();
 }
 
+// minuteman oracle: exact Baseline->DFG arming for listed functions. Returns true if handled.
+static bool armDFGFromOracle(CodeBlock* codeBlock)
+{
+    if (!TierUpOracle::isEnabled()) [[likely]]
+        return false;
+    int64_t n = TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::DFG);
+    if (n == TierUpOracle::Default)
+        return false;
+    if (auto* jitData = codeBlock->baselineJITData()) {
+        if (n == TierUpOracle::Never)
+            jitData->executeCounter().deferIndefinitely();
+        else
+            jitData->executeCounter().setNewThreshold(TierUpOracle::clampCount(n), nullptr);
+    }
+    return true;
+}
+
 template<CodeBlock::QuickTierUpCheck check>
 void CodeBlock::optimizeAfterWarmUpImpl()
 {
+    if (armDFGFromOracle(this)) [[unlikely]]
+        return;
     dataLogLnIf(Options::verboseOSR(), *this, ": Optimizing after warm-up.");
 #if ENABLE(DFG_JIT)
     if (auto* jitData = baselineJITData()) {
@@ -2660,6 +2702,8 @@ void CodeBlock::optimizeAfterWarmUpImpl()
         }
         if (TierUpOverride::isEnabled()) [[unlikely]]
             threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::DFG, threshold);
+        if (TierUpPolicy::isEnabled()) [[unlikely]]
+            threshold = TierUpPolicy::adjustThreshold(this, TierUpPolicy::Step::DFG, threshold);
         jitData->executeCounter().setNewThreshold(adjustedCounterValue(threshold), this);
     }
 #endif
@@ -2672,12 +2716,16 @@ void CodeBlock::optimizeAfterWarmUpIgnoreQuickTierUp() { optimizeAfterWarmUpImpl
 
 void CodeBlock::optimizeAfterLongWarmUp()
 {
+    if (armDFGFromOracle(this)) [[unlikely]]
+        return;
     dataLogLnIf(Options::verboseOSR(), *this, ": Optimizing after long warm-up.");
 #if ENABLE(DFG_JIT)
     if (auto* jitData = baselineJITData()) {
         int32_t threshold = Options::thresholdForOptimizeAfterLongWarmUp();
         if (TierUpOverride::isEnabled()) [[unlikely]]
             threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::DFG, threshold);
+        if (TierUpPolicy::isEnabled()) [[unlikely]]
+            threshold = TierUpPolicy::adjustThreshold(this, TierUpPolicy::Step::DFG, threshold);
         jitData->executeCounter().setNewThreshold(adjustedCounterValue(threshold), this);
     }
 #endif
@@ -2691,6 +2739,8 @@ void CodeBlock::optimizeSoon()
         int32_t threshold = Options::thresholdForOptimizeSoon();
         if (TierUpOverride::isEnabled()) [[unlikely]]
             threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::DFG, threshold);
+        if (TierUpPolicy::isEnabled()) [[unlikely]]
+            threshold = TierUpPolicy::adjustThreshold(this, TierUpPolicy::Step::DFG, threshold);
         jitData->executeCounter().setNewThreshold(adjustedCounterValue(threshold), this);
     }
 #endif
@@ -3011,6 +3061,35 @@ void CodeBlock::updateAllArrayProfilePredictions()
     });
 }
 
+uint64_t CodeBlock::minutemanProfileFingerprint()
+{
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    auto mix = [&](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+    forEachValueProfile([&](auto& profile, bool) { mix(static_cast<uint64_t>(profile.m_prediction)); });
+    if (m_metadata) {
+        auto process = [&](ArrayProfile& profile) {
+            mix(static_cast<uint64_t>(profile.observedArrayModes()) ^ (profile.outOfBounds() ? 1ull << 62 : 0) ^ (profile.mayStoreToHole() ? 1ull << 61 : 0));
+        };
+#define VISIT(__op) \
+        m_metadata->forEach<__op>([&] (auto& metadata) { process(metadata.m_arrayProfile); });
+        FOR_EACH_OPCODE_WITH_SIMPLE_ARRAY_PROFILE(VISIT)
+#undef VISIT
+        m_metadata->forEach<OpIteratorNext>([&] (auto& metadata) { process(metadata.m_iterableProfile); });
+    }
+#if ENABLE(JIT)
+    if (auto* jitData = baselineJITData()) {
+        ConcurrentJSLocker locker(m_lock);
+        for (auto& cache : jitData->propertyInlineCaches()) {
+            PropertyInlineCacheSummary summary = PropertyInlineCache::summary(locker, vm(), &cache);
+            if (summary == PropertyInlineCacheSummary::Megamorphic)
+                continue; // terminal: drops out
+            mix((static_cast<uint64_t>(summary) << 8) ^ static_cast<uint64_t>(cache.cacheType()));
+        }
+    }
+#endif
+    return h;
+}
+
 void CodeBlock::updateAllArrayAllocationProfilePredictions()
 {
     forEachArrayAllocationProfile([&](ArrayAllocationProfile& profile) {
@@ -3037,6 +3116,11 @@ void CodeBlock::updatePredictionsConcurrently()
 
 bool CodeBlock::shouldOptimizeNowFromBaseline()
 {
+    if (TierUpOracle::isEnabled()) [[unlikely]] {
+        int64_t n = TierUpOracle::countFor(this, TierUpOracle::Tier::DFG);
+        if (n != TierUpOracle::Default && n != TierUpOracle::Never)
+            return true; // exact timing: skip the profile fullness/liveness delay
+    }
     dataLogLnIf(Options::verboseOSR(), "Considering optimizing ", *this, "...");
 
     if (m_optimizationDelayCounter >= Options::maximumOptimizationDelay())

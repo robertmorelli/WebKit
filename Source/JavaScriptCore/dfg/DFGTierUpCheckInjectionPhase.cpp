@@ -37,6 +37,7 @@
 #include "FunctionAllowlist.h"
 #include "JSCJSValueInlines.h"
 #include "TierUpOverride.h"
+#include "TierUpOracle.h"
 #include <wtf/NeverDestroyed.h>
 
 namespace JSC { namespace DFG {
@@ -75,6 +76,8 @@ public:
             return false;
         
         if (!Options::useOSREntryToFTL())
+            level = FTL::CanCompile;
+        if (TierUpOracle::isEnabled() && !TierUpOracle::osrAllowed(m_graph.m_profiledBlock)) [[unlikely]]
             level = FTL::CanCompile;
         
         m_graph.ensureCPSNaturalLoops();

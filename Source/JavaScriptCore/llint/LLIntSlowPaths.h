@@ -50,6 +50,7 @@ extern "C" void SYSV_ABI llint_write_barrier_slow(CallFrame*, JSCell*) REFERENCE
     LLINT_SLOW_PATH_DECL(name) REFERENCED_FROM_ASM WTF_INTERNAL
 
 LLINT_SLOW_PATH_HIDDEN_DECL(trace_prologue);
+LLINT_SLOW_PATH_HIDDEN_DECL(slow_path_minuteman_profile_call);
 LLINT_SLOW_PATH_HIDDEN_DECL(trace_prologue_function_for_call);
 LLINT_SLOW_PATH_HIDDEN_DECL(trace_prologue_function_for_construct);
 LLINT_SLOW_PATH_HIDDEN_DECL(trace_arityCheck_for_call);

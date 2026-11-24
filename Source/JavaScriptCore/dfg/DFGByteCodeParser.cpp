@@ -26,6 +26,8 @@
 #include "config.h"
 #include "DFGByteCodeParser.h"
 
+#include "TierUpExperts.h"
+#include "ProfileConsumptionLog.h"
 #if ENABLE(DFG_JIT)
 
 #include "ArithProfile.h"
@@ -764,6 +766,8 @@ private:
         ASSERT(node->origin.semantic.bytecodeIndex() == m_currentIndex);
         LazyOperandValueProfileKey key(m_currentIndex, node->operand());
         SpeculatedType prediction = m_inlineStackTop->m_lazyOperands.prediction(key);
+        if (TierUpExperts::enabled()) [[unlikely]]
+            TierUpExperts::noteConsumedPrediction(m_codeBlock, m_inlineStackTop->m_profiledBlock, TierUpExperts::ProfileKind::Lazy, m_currentIndex, node->operand().asBits(), prediction);
         node->variableAccessData()->predict(prediction);
         return node;
     }
@@ -1269,6 +1273,8 @@ private:
 
             JSValue* specFailValue = inlineStackEntry->m_specFailValueProfileBuckets.get(bytecodeIndex);
             SpeculatedType prediction = codeBlock->valueProfilePredictionForBytecodeIndex(codeOrigin.bytecodeIndex(), specFailValue);
+            if (TierUpExperts::enabled()) [[unlikely]]
+                TierUpExperts::noteConsumedPrediction(m_codeBlock, codeBlock, TierUpExperts::ProfileKind::Bytecode, codeOrigin.bytecodeIndex(), 0, prediction);
             auto* fuzzerAgent = m_vm->fuzzerAgent();
             if (fuzzerAgent) [[unlikely]]
                 return fuzzerAgent->getPrediction(codeBlock, codeOrigin, prediction) & SpecBytecodeTop;
@@ -2626,7 +2632,10 @@ bool ByteCodeParser::handleVarargsInlining(Node* callTargetNode, Operand result,
             // calls.
             if (codeBlock && argument < static_cast<unsigned>(codeBlock->numParameters())) {
                 ArgumentValueProfile& profile = codeBlock->valueProfileForArgument(argument);
-                variable->predict(profile.computeUpdatedPrediction());
+                SpeculatedType prediction = profile.computeUpdatedPrediction();
+                if (TierUpExperts::enabled()) [[unlikely]]
+                    TierUpExperts::noteConsumedPrediction(m_codeBlock, codeBlock, TierUpExperts::ProfileKind::Argument, BytecodeIndex(0), argument, prediction);
+                variable->predict(prediction);
             }
             
             Node* setArgument = addToGraph(numSetArguments >= mandatoryMinimum ? SetArgumentMaybe : SetArgumentDefinitely, OpInfo(variable));
@@ -11702,6 +11711,8 @@ ByteCodeParser::InlineStackEntry::InlineStackEntry(
     , m_returnValue(returnValue)
     , m_caller(byteCodeParser->m_inlineStackTop)
 {
+    if (ProfileConsumptionLog::isEnabled()) [[unlikely]]
+        ProfileConsumptionLog::noteInlinee(m_profiledBlock);
     {
         m_exitProfile.initialize(m_profiledBlock->unlinkedCodeBlock());
         m_lazyOperands.initialize(m_profiledBlock->lazyValueProfiles());
@@ -14432,6 +14443,10 @@ bool ByteCodeParser::parse()
     ASSERT(!m_currentIndex.offset());
     
     VERBOSE_LOG("Parsing ", *m_codeBlock, "\n");
+
+    std::optional<ProfileConsumptionLog::CompileScope> consumptionLog;
+    if (ProfileConsumptionLog::isEnabled()) [[unlikely]]
+        consumptionLog.emplace(m_codeBlock, m_profiledBlock, static_cast<int>(m_graph.m_plan.mode()));
 
     planInlining();
 

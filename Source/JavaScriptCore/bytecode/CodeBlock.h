@@ -750,6 +750,10 @@ public:
     void updateAllNonLazyValueProfilePredictions();
     void updateAllLazyValueProfilePredictions();
     void updateAllArrayProfilePredictions();
+    // minuteman (tools/TierUpExperts, Quiescence): 64-bit fingerprint of value predictions,
+    // array profiles and inline-cache states (megamorphic caches excluded). Same walk as the
+    // prediction update JSC performs at its tier-up checks; call after updatePredictionsConcurrently().
+    uint64_t minutemanProfileFingerprint();
     void updateAllArrayAllocationProfilePredictions();
     void updateAllPredictions();
     void updatePredictionsConcurrently();

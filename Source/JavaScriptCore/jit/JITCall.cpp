@@ -43,6 +43,7 @@
 #include "SlowPathCall.h"
 #include "StackAlignment.h"
 #include "ThunkGenerators.h"
+#include "MinutemanCallSiteProfile.h"
 
 namespace JSC {
 
@@ -260,6 +261,12 @@ bool JIT::compileTailCall(const OpTailCall& bytecode, BaselineUnlinkedCallLinkIn
 template<typename Op>
 void JIT::compileOpCall(const JSInstruction* instruction)
 {
+#if ENABLE(MINUTEMAN_CALLSITE_PROFILING)
+    // minuteman prototype: record argument types at this call site (nothing is live here
+    // except pinned registers). Compiled out of normal builds.
+    if (Options::minutemanCallSiteProfile())
+        callOperationNoExceptionCheck(operationMinutemanProfileCall, TrustedImmPtr(&vm()), m_bytecodeIndex.asBits());
+#endif
     auto bytecode = instruction->as<Op>();
     VirtualRegister callee = calleeFor(bytecode, m_bytecodeIndex.checkpoint());
 

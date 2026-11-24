@@ -855,7 +855,7 @@ void OSRExit::compileExit(CCallHelpers& jit, VM& vm, const OSRExit& exit, const 
     // counter to 0; otherwise we set the counter to
     // counterValueForOptimizeAfterWarmUp().
 
-    handleExitCounts(vm, jit, exit);
+    handleExitCounts(vm, jit, exit, exit.m_valueProfile);
 
     // Reify inlined call frames.
 

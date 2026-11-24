@@ -37,10 +37,13 @@
 #include "LLIntThunks.h"
 #include "PropertyInlineCache.h"
 #include "TierUpOverride.h"
+#include "TierUpPolicy.h"
+#include "TierUpOracle.h"
+#include "TierUpExperts.h"
 
 namespace JSC { namespace DFG {
 
-void handleExitCounts(VM& vm, CCallHelpers& jit, const OSRExitBase& exit)
+void handleExitCounts(VM& vm, CCallHelpers& jit, const OSRExitBase& exit, const MethodOfGettingAValueProfile& valueProfile)
 {
     if (!exitKindMayJettison(exit.m_kind)) {
         // FIXME: We may want to notice that we're frequently exiting
@@ -58,54 +61,69 @@ void handleExitCounts(VM& vm, CCallHelpers& jit, const OSRExitBase& exit)
     jit.load32(AssemblyHelpers::Address(GPRInfo::regT3, CodeBlock::offsetOfOSRExitCounter()), GPRInfo::regT2);
     jit.add32(AssemblyHelpers::TrustedImm32(1), GPRInfo::regT2);
     jit.store32(GPRInfo::regT2, AssemblyHelpers::Address(GPRInfo::regT3, CodeBlock::offsetOfOSRExitCounter()));
-    
-    jit.move(AssemblyHelpers::TrustedImmPtr(jit.baselineCodeBlock()), GPRInfo::regT0);
-    jit.loadPtr(AssemblyHelpers::Address(GPRInfo::regT0, CodeBlock::offsetOfJITData()), GPRInfo::regT5);
 
-    auto isLLIntCodeBlock = jit.branchTestPtr(CCallHelpers::Zero, GPRInfo::regT5);
-    AssemblyHelpers::Jump reoptimizeNow = jit.branch32(
-        AssemblyHelpers::GreaterThanOrEqual,
-        AssemblyHelpers::Address(GPRInfo::regT5, BaselineJITData::offsetOfJITExecuteCounter()),
-        AssemblyHelpers::TrustedImm32(0));
-    isLLIntCodeBlock.link(&jit);
+    if (TierUpExperts::enabled()) [[unlikely]] {
+        // minuteman: every exit is a deopt decision point. All deopt experts vote in C++
+        // (jsc-default computes JSC's own rule there); the acted decision comes back in regT1.
+        const TierUpExperts::ExitSiteInfo* info = TierUpExperts::retainExitSiteInfo(jit.codeBlock(), exit, valueProfile);
+        jit.setupArguments<decltype(operationMinutemanExitDecision)>(GPRInfo::regT3, AssemblyHelpers::TrustedImmPtr(info));
+        jit.prepareCallOperation(vm);
+        jit.move(AssemblyHelpers::TrustedImmPtr(tagCFunction<OperationPtrTag>(operationMinutemanExitDecision)), GPRInfo::nonArgGPR0);
+        jit.call(GPRInfo::nonArgGPR0, OperationPtrTag);
+        jit.move(GPRInfo::returnValueGPR, GPRInfo::regT1);
+        jit.move(AssemblyHelpers::TrustedImmPtr(jit.codeBlock()), GPRInfo::regT3);
+        jit.move(AssemblyHelpers::TrustedImmPtr(jit.baselineCodeBlock()), GPRInfo::regT0);
+        jit.loadPtr(AssemblyHelpers::Address(GPRInfo::regT0, CodeBlock::offsetOfJITData()), GPRInfo::regT5);
+        tooFewFails = jit.branchTest32(AssemblyHelpers::Zero, GPRInfo::regT1);
+    } else {
+        jit.move(AssemblyHelpers::TrustedImmPtr(jit.baselineCodeBlock()), GPRInfo::regT0);
+        jit.loadPtr(AssemblyHelpers::Address(GPRInfo::regT0, CodeBlock::offsetOfJITData()), GPRInfo::regT5);
 
-    // We want to figure out if there's a possibility that we're in a loop. For the outermost
-    // code block in the inline stack, we handle this appropriately by having the loop OSR trigger
-    // check the exit count of the replacement of the CodeBlock from which we are OSRing. The
-    // problem is the inlined functions, which might also have loops, but whose baseline versions
-    // don't know where to look for the exit count. Figure out if those loops are severe enough
-    // that we had tried to OSR enter. If so, then we should use the loop reoptimization trigger.
-    // Otherwise, we should use the normal reoptimization trigger.
-    
-    AssemblyHelpers::JumpList loopThreshold;
-    
-    for (InlineCallFrame* inlineCallFrame = exit.m_codeOrigin.inlineCallFrame(); inlineCallFrame; inlineCallFrame = inlineCallFrame->directCaller.inlineCallFrame()) {
-        loopThreshold.append(
-            jit.branchTest8(
-                AssemblyHelpers::NonZero,
-                AssemblyHelpers::AbsoluteAddress(
-                    inlineCallFrame->baselineCodeBlock->ownerExecutable()->addressOfDidTryToEnterInLoop())));
-    }
-    
-    jit.move(
-        AssemblyHelpers::TrustedImm32(jit.codeBlock()->exitCountThresholdForReoptimization()),
-        GPRInfo::regT1);
-    
-    if (!loopThreshold.empty()) {
-        AssemblyHelpers::Jump done = jit.jump();
+        auto isLLIntCodeBlock = jit.branchTestPtr(CCallHelpers::Zero, GPRInfo::regT5);
+        AssemblyHelpers::Jump reoptimizeNow = jit.branch32(
+            AssemblyHelpers::GreaterThanOrEqual,
+            AssemblyHelpers::Address(GPRInfo::regT5, BaselineJITData::offsetOfJITExecuteCounter()),
+            AssemblyHelpers::TrustedImm32(0));
+        isLLIntCodeBlock.link(&jit);
 
-        loopThreshold.link(&jit);
+        // We want to figure out if there's a possibility that we're in a loop. For the outermost
+        // code block in the inline stack, we handle this appropriately by having the loop OSR trigger
+        // check the exit count of the replacement of the CodeBlock from which we are OSRing. The
+        // problem is the inlined functions, which might also have loops, but whose baseline versions
+        // don't know where to look for the exit count. Figure out if those loops are severe enough
+        // that we had tried to OSR enter. If so, then we should use the loop reoptimization trigger.
+        // Otherwise, we should use the normal reoptimization trigger.
+
+        AssemblyHelpers::JumpList loopThreshold;
+
+        for (InlineCallFrame* inlineCallFrame = exit.m_codeOrigin.inlineCallFrame(); inlineCallFrame; inlineCallFrame = inlineCallFrame->directCaller.inlineCallFrame()) {
+            loopThreshold.append(
+                jit.branchTest8(
+                    AssemblyHelpers::NonZero,
+                    AssemblyHelpers::AbsoluteAddress(
+                        inlineCallFrame->baselineCodeBlock->ownerExecutable()->addressOfDidTryToEnterInLoop())));
+        }
+
         jit.move(
-            AssemblyHelpers::TrustedImm32(
-                jit.codeBlock()->exitCountThresholdForReoptimizationFromLoop()),
+            AssemblyHelpers::TrustedImm32(jit.codeBlock()->exitCountThresholdForReoptimization()),
             GPRInfo::regT1);
-        
-        done.link(&jit);
+
+        if (!loopThreshold.empty()) {
+            AssemblyHelpers::Jump done = jit.jump();
+
+            loopThreshold.link(&jit);
+            jit.move(
+                AssemblyHelpers::TrustedImm32(
+                    jit.codeBlock()->exitCountThresholdForReoptimizationFromLoop()),
+                GPRInfo::regT1);
+    
+            done.link(&jit);
+        }
+
+        tooFewFails = jit.branch32(AssemblyHelpers::BelowOrEqual, GPRInfo::regT2, GPRInfo::regT1);
+    
+        reoptimizeNow.link(&jit);
     }
-    
-    tooFewFails = jit.branch32(AssemblyHelpers::BelowOrEqual, GPRInfo::regT2, GPRInfo::regT1);
-    
-    reoptimizeNow.link(&jit);
     
     jit.setupArguments<decltype(operationTriggerReoptimizationNow)>(GPRInfo::regT0, GPRInfo::regT3, AssemblyHelpers::TrustedImmPtr(exit.m_codeOrigin.inlineCallFrame()));
     jit.prepareCallOperation(vm);
@@ -120,10 +138,17 @@ void handleExitCounts(VM& vm, CCallHelpers& jit, const OSRExitBase& exit)
     int32_t longWarmUpThreshold = Options::thresholdForOptimizeAfterLongWarmUp();
     if (TierUpOverride::isEnabled()) [[unlikely]]
         longWarmUpThreshold = TierUpOverride::adjustThreshold(jit.baselineCodeBlock(), TierUpOverride::Step::DFG, longWarmUpThreshold);
+    if (TierUpPolicy::isEnabled()) [[unlikely]]
+        longWarmUpThreshold = TierUpPolicy::adjustThreshold(jit.baselineCodeBlock(), TierUpPolicy::Step::DFG, longWarmUpThreshold);
     int32_t activeThreshold =
         jit.baselineCodeBlock()->adjustedCounterValue(longWarmUpThreshold);
     int32_t targetValue = applyMemoryUsageHeuristicsAndConvertToInt(
         activeThreshold, jit.baselineCodeBlock());
+    if (TierUpOracle::isEnabled()) [[unlikely]] {
+        int64_t n = TierUpOracle::countFor(jit.baselineCodeBlock(), TierUpOracle::Tier::DFG);
+        if (n != TierUpOracle::Default && n != TierUpOracle::Never)
+            activeThreshold = targetValue = TierUpOracle::clampCount(n);
+    }
     int32_t clippedValue;
     switch (jit.codeBlock()->jitType()) {
     case JITType::DFGJIT:

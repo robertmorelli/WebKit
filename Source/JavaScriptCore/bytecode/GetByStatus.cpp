@@ -25,6 +25,7 @@
 
 #include "config.h"
 #include "GetByStatus.h"
+#include "ProfileConsumptionLog.h"
 
 #include "BytecodeStructs.h"
 #include "CacheableIdentifierInlines.h"
@@ -203,17 +204,23 @@ GetByStatus GetByStatus::computeFor(CodeBlock* profiledBlock, ICStatusMap& map, 
 
 #if ENABLE(DFG_JIT)
     result = computeForPropertyInlineCacheWithoutExitSiteFeedback(locker, profiledBlock, map.get(CodeOrigin(codeOrigin.bytecodeIndex())).propertyCache, callExitSiteData, codeOrigin);
-    if (didExit)
-        return result.slowVersion();
+    if (didExit) {
+        result = result.slowVersion();
+        if (ProfileConsumptionLog::isEnabled()) [[unlikely]]
+            ProfileConsumptionLog::noteStatus(profiledBlock, codeOrigin.bytecodeIndex(), ProfileConsumptionLog::Access::Get, true, result.state(), result.numVariants());
+        return result;
+    }
 #else
     UNUSED_PARAM(map);
     UNUSED_PARAM(didExit);
     UNUSED_PARAM(callExitSiteData);
 #endif
 
+    bool fromBaselineIC = !!result;
     if (!result)
-        return computeFromLLInt(profiledBlock, codeOrigin.bytecodeIndex());
-    
+        result = computeFromLLInt(profiledBlock, codeOrigin.bytecodeIndex());
+    if (ProfileConsumptionLog::isEnabled()) [[unlikely]]
+        ProfileConsumptionLog::noteStatus(profiledBlock, codeOrigin.bytecodeIndex(), ProfileConsumptionLog::Access::Get, fromBaselineIC, result.state(), result.numVariants());
     return result;
 }
 

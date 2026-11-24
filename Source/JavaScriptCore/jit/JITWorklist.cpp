@@ -363,6 +363,14 @@ auto JITWorklist::runOneTask() -> TaskResult
     return TaskResult::Ran;
 }
 
+int64_t JITWorklist::idleCapacity(JITPlan::Tier tier) const
+{
+    Locker locker { *m_lock };
+    size_t t = static_cast<size_t>(tier);
+    return static_cast<int64_t>(m_maximumNumberOfConcurrentCompilationsPerTier[t])
+        - static_cast<int64_t>(m_ongoingCompilationsPerTier[t]) - static_cast<int64_t>(m_queues[t].size());
+}
+
 size_t JITWorklist::queueLength() const
 {
     Locker locker { *m_lock };

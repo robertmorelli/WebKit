@@ -637,7 +637,7 @@ static MacroAssemblerCodeRef<OSRExitPtrTag> compileStub(VM& vm, unsigned exitID,
         jit.storePtr(CCallHelpers::TrustedImm32(0), CCallHelpers::Address(GPRInfo::regT0));
     }
 
-    handleExitCounts(vm, jit, exit);
+    handleExitCounts(vm, jit, exit, exit.m_descriptor->m_valueProfile);
     reifyInlinedCallFrames(jit, exit);
     adjustAndJumpToTarget(vm, jit, exit);
     

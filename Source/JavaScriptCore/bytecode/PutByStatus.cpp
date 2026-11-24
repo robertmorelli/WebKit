@@ -25,6 +25,7 @@
 
 #include "config.h"
 #include "PutByStatus.h"
+#include "ProfileConsumptionLog.h"
 
 #include "BytecodeStructs.h"
 #include "CacheableIdentifierInlines.h"
@@ -152,9 +153,11 @@ PutByStatus PutByStatus::computeFor(CodeBlock* profiledBlock, ICStatusMap& map, 
     
     PropertyInlineCache* propertyCache = map.get(CodeOrigin(bytecodeIndex)).propertyCache;
     PutByStatus result = computeForPropertyInlineCache(locker, profiledBlock, propertyCache, callExitSiteData, CodeOrigin(bytecodeIndex));
+    bool fromBaselineIC = !!result;
     if (!result)
-        return computeFromLLInt(profiledBlock, bytecodeIndex);
-    
+        result = computeFromLLInt(profiledBlock, bytecodeIndex);
+    if (ProfileConsumptionLog::isEnabled()) [[unlikely]]
+        ProfileConsumptionLog::noteStatus(profiledBlock, bytecodeIndex, ProfileConsumptionLog::Access::Put, fromBaselineIC, result.state(), result.numVariants());
     return result;
 #else // ENABLE(JIT)
     UNUSED_PARAM(map);

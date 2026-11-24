@@ -26,6 +26,8 @@
 #include "config.h"
 #include "DFGJITCompiler.h"
 
+#include "TierUpExperts.h"
+
 #if ENABLE(DFG_JIT)
 
 #include "CodeBlock.h"
@@ -149,6 +151,8 @@ void JITCompiler::compileEntry()
     // check) which will be dependent on stack layout. (We'd need to account for this in
     // both normal return code and when jumping to an exception handler).
     emitFunctionPrologue();
+    if (TierUpExperts::enabled()) [[unlikely]]
+        add64(TrustedImm32(1), AbsoluteAddress(TierUpExperts::workCounterFor(m_graph.m_codeBlock, false)));
     jitAssertCodeBlockOnCallFrameWithType(GPRInfo::regT2, JITType::DFGJIT);
     if (m_graph.m_codeBlock->couldBeTainted())
         store8(TrustedImm32(1), vm().addressOfMightBeExecutingTaintedCode());

@@ -87,6 +87,9 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 #include "TypeProfilerLog.h"
 #include "VMInlines.h"
 #include "VMTrapsInlines.h"
+#include "TierUpOracle.h"
+#include "TierUpExperts.h"
+#include "MinutemanCallSiteProfile.h"
 
 IGNORE_WARNINGS_BEGIN("frame-address")
 
@@ -2911,12 +2914,27 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
         dataLog("\n");
     }
 
+    // minuteman experts: every counter visit that could start a new DFG compile is a decision
+    // point, including checkpoint visits before JSC's own threshold.
+    // The prologue check passes bytecode index 0 (which is a valid, truthy BytecodeIndex); loop
+    // hints have non-zero offsets.
+    auto minutemanDP = bytecodeIndex.offset() ? TierUpExperts::DP::BaselineLoopOSR : TierUpExperts::DP::BaselineToDFG;
+    auto minutemanCanStartCompile = [&] {
+        return !codeBlock->hasOptimizedReplacement()
+            && JITWorklist::ensureGlobalWorklist().compilationState(vm, JITCompilationKey(codeBlock, Options::forceUnlinkedDFG() ? JITCompilationMode::UnlinkedDFG : JITCompilationMode::DFG)) == JITWorklist::NotKnown;
+    };
+    bool minutemanExpertGo = false;
     if (!codeBlock->checkIfOptimizationThresholdReached()) {
-        CODEBLOCK_LOG_EVENT(codeBlock, "delayOptimizeToDFG", ("counter = ", codeBlock->baselineExecuteCounter()));
-        codeBlock->updateAllPredictions();
-        dataLogLnIf(Options::verboseOSR(), "Choosing not to optimize ", *codeBlock, " yet, because the threshold hasn't been reached.");
-        OPERATION_RETURN(scope, encodeResult(nullptr, nullptr));
+        if (TierUpExperts::enabled() && minutemanCanStartCompile()) [[unlikely]]
+            minutemanExpertGo = TierUpExperts::tierUp(minutemanDP, codeBlock, false);
+        if (!minutemanExpertGo) {
+            CODEBLOCK_LOG_EVENT(codeBlock, "delayOptimizeToDFG", ("counter = ", codeBlock->baselineExecuteCounter()));
+            codeBlock->updateAllPredictions();
+            dataLogLnIf(Options::verboseOSR(), "Choosing not to optimize ", *codeBlock, " yet, because the threshold hasn't been reached.");
+            OPERATION_RETURN(scope, encodeResult(nullptr, nullptr));
+        }
     }
+
     
     if (vm.hasTerminationRequest()) [[unlikely]] {
         // If termination of the current stack of execution is in progress,
@@ -2992,7 +3010,10 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
         // attempt OSR entry. Hence it might even be correct for
         // shouldReoptimizeFromLoopNow() to always return true. But we make it do some
         // additional checking anyway, to reduce the amount of recompilation thrashing.
-        if (replacement->shouldReoptimizeFromLoopNow()) {
+        bool reoptimizeFromLoop = replacement->shouldReoptimizeFromLoopNow();
+        if (TierUpExperts::enabled()) [[unlikely]]
+            reoptimizeFromLoop = TierUpExperts::loopReoptimize(replacement, reoptimizeFromLoop);
+        if (reoptimizeFromLoop) {
             CODEBLOCK_LOG_EVENT(codeBlock, "delayOptimizeToDFG", ("should reoptimize from loop now"));
             dataLogLnIf(Options::verboseOSR(),
                 "Triggering reoptimization of ", codeBlock,
@@ -3001,7 +3022,13 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
             OPERATION_RETURN(scope, encodeResult(nullptr, nullptr));
         }
     } else {
-        if (!codeBlock->shouldOptimizeNowFromBaseline()) {
+        bool go = minutemanExpertGo;
+        if (!go) {
+            go = codeBlock->shouldOptimizeNowFromBaseline();
+            if (TierUpExperts::enabled()) [[unlikely]]
+                go = TierUpExperts::tierUp(minutemanDP, codeBlock, go);
+        }
+        if (!go) {
             dataLogLnIf(Options::verboseOSR(),
                 "Delaying optimization for ", *codeBlock,
                 " because of insufficient profiling.");
@@ -3038,6 +3065,12 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
     CodeBlock* optimizedCodeBlock = codeBlock->replacement();
     ASSERT(optimizedCodeBlock && JSC::JITCode::isOptimizingJIT(optimizedCodeBlock->jitType()));
     
+    if (TierUpOracle::isEnabled() && bytecodeIndex && !TierUpOracle::osrAllowed(codeBlock)) [[unlikely]] {
+        // osr=off: the optimized code takes effect at the next invocation.
+        codeBlock->optimizeAfterWarmUp();
+        OPERATION_RETURN(scope, encodeResult(nullptr, nullptr));
+    }
+
     if (void* dataBuffer = DFG::prepareOSREntry(vm, callFrame, optimizedCodeBlock, bytecodeIndex)) {
         CODEBLOCK_LOG_EVENT(optimizedCodeBlock, "osrEntry", ("at bc#", bytecodeIndex));
         dataLogLnIf(Options::verboseOSR(), "Performing OSR ", codeBlock, " -> ", optimizedCodeBlock);
@@ -3084,6 +3117,18 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
 
     CODEBLOCK_LOG_EVENT(codeBlock, "delayOptimizeToDFG", ("OSR failed"));
     OPERATION_RETURN(scope, encodeResult(nullptr, nullptr));
+}
+
+// minuteman prototype: per-call-site argument type profiling from Baseline code (emitted only
+// in builds with ENABLE_MINUTEMAN_CALLSITE_PROFILING and --minutemanCallSiteProfile=1).
+JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationMinutemanProfileCall, void, (VM* vmPointer, uint32_t bytecodeIndexBits))
+{
+    VM& vm = *vmPointer;
+    CallFrame* callFrame = DECLARE_CALL_FRAME(vm);
+    JITOperationPrologueCallFrameTracer tracer(vm, callFrame);
+    CodeBlock* codeBlock = callFrame->codeBlock();
+    BytecodeIndex bytecodeIndex = BytecodeIndex::fromBits(bytecodeIndexBits);
+    MinutemanCallSiteProfile::record(callFrame, codeBlock, codeBlock->instructions().at(bytecodeIndex).ptr());
 }
 
 JSC_DEFINE_JIT_OPERATION(operationTryOSREnterAtCatchAndValueProfile, UGPRPair, (VM* vmPointer, uint32_t bytecodeIndexBits))

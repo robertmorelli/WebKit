@@ -164,6 +164,7 @@ using F_JITOperation_GFJZZ = OperationReturnType<CallFrame*>(JIT_OPERATION_ATTRI
 // the return location from one of the calls out to one of the helper operations above.
 
 JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationLookupExceptionHandler, void, (VM*));
+JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationMinutemanProfileCall, void, (VM*, uint32_t));
 JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationLookupExceptionHandlerFromCallerFrame, void, (VM*));
 JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationVMHandleException, void, (VM*));
 JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationThrowStackOverflowErrorFromThunk, void, (JSGlobalObject*));

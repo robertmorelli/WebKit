@@ -25,6 +25,7 @@
 
 #include "config.h"
 #include "DFGPredictionInjectionPhase.h"
+#include "TierUpExperts.h"
 
 #if ENABLE(DFG_JIT)
 
@@ -64,6 +65,8 @@ public:
                 SpeculatedType prediction = profile.computeUpdatedPrediction();
                 if (isGeneratorBody && (arg == static_cast<size_t>(JSGenerator::Argument::Frame) || arg == static_cast<size_t>(JSGenerator::Argument::Value)))
                     prediction |= SpecOther;
+                if (TierUpExperts::enabled()) [[unlikely]]
+                    TierUpExperts::noteConsumedPrediction(codeBlock(), profiledBlock(), TierUpExperts::ProfileKind::Argument, BytecodeIndex(0), arg, prediction);
                 arguments[arg]->variableAccessData()->predict(prediction);
             }
         }

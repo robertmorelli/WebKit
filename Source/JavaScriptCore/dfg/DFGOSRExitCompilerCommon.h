@@ -36,7 +36,7 @@
 
 namespace JSC { namespace DFG {
 
-void handleExitCounts(VM&, CCallHelpers&, const OSRExitBase&);
+void handleExitCounts(VM&, CCallHelpers&, const OSRExitBase&, const MethodOfGettingAValueProfile&);
 void reifyInlinedCallFrames(CCallHelpers&, const OSRExitBase&);
 void adjustAndJumpToTarget(VM&, CCallHelpers&, const OSRExitBase&);
 CCallHelpers::Address calleeSaveSlot(InlineCallFrame*, CodeBlock* baselineCodeBlock, GPRReg calleeSave);

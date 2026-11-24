@@ -106,6 +106,7 @@ public:
 
 private:
     friend class DFG::OSRExitStream;
+    friend struct MinutemanValueProfileAccess; // read-only, tools/TierUpExperts.cpp
 
     enum class Kind : uint8_t {
         None,

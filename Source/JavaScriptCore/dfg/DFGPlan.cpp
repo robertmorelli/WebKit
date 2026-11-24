@@ -26,6 +26,7 @@
 #include "config.h"
 #include "DFGPlan.h"
 
+#include "TierUpExperts.h"
 #if ENABLE(DFG_JIT)
 
 #include "DFGArgumentsEliminationPhase.h"
@@ -637,6 +638,9 @@ CompilationResult Plan::finalize()
 
     // We will establish new references from the code block to things. So, we need a barrier.
     m_vm->writeBarrier(m_codeBlock);
+
+    if (result == CompilationResult::CompilationSuccessful && TierUpExperts::enabled()) [[unlikely]]
+        TierUpExperts::noteOptimizedInstalled(m_codeBlock);
 
     m_callback->compilationDidComplete(m_codeBlock, m_profiledDFGCodeBlock, result);
 

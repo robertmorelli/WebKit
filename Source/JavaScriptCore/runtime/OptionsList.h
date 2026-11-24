@@ -158,6 +158,27 @@ bool hasCapacityToUseLargeGigacage();
     v(OptionRange, bytecodeRangeToFTLCompile, nullptr, Normal, "bytecode size range to allow FTL compilation on, e.g. 1:100"_s) \
     v(OptionString, jitAllowlist, nullptr, Normal, "file with newline separated list of function signatures to allow compilation on or, if no such file exists, the function signature to allow"_s) \
     v(OptionString, dfgAllowlist, nullptr, Normal, "file with newline separated list of function signatures to allow DFG compilation on or, if no such file exists, the function signature to allow"_s) \
+    v(Bool, minutemanCallSiteProfile, false, Normal, "minuteman prototype: record per-call-site argument SpeculatedType masks (only in builds with ENABLE_MINUTEMAN_CALLSITE_PROFILING)"_s) \
+    v(OptionString, minutemanCallSiteProfileFile, nullptr, Normal, "minuteman prototype: JSON output path for --minutemanCallSiteProfile"_s) \
+    v(Unsigned, minutemanCallSiteProfileSampleRate, 1, Normal, "minuteman prototype: record 1 in N calls"_s) \
+    v(Bool, tierUpTimeAttribution, false, Normal, "minuteman: sample the top frame every tierUpTimeAttributionIntervalUs and charge time to (function, tier); see tools/TierUpTimeAttribution.h. Off by default."_s) \
+    v(Unsigned, tierUpTimeAttributionIntervalUs, 1000, Normal, "minuteman: time attribution sampling interval (us)"_s) \
+    v(Bool, tierUpTimeAttributionSelfSampling, false, Normal, "minuteman: sample with a per-thread CPU-time SIGPROF timer delivered to the JS thread (lock-free ring, no suspend/resume) instead of suspending it; Linux x86_64 only"_s) \
+    v(Bool, verboseTierUpTimeAttribution, false, Normal, "minuteman: print time attribution summary at exit"_s) \
+    v(OptionString, tierUpExpert, nullptr, Normal, "minuteman: DFG/FTL tier-up expert: jsc-default, cost-benefit, stability-gate, caller-triggered, inline-aware, mixer (see tools/TierUpExperts.h). Off by default."_s) \
+    v(OptionString, deoptExpert, nullptr, Normal, "minuteman: jettison expert: jsc-default, rate-based, quarantine, mixer (see tools/TierUpExperts.h). Off by default."_s) \
+    v(Bool, verboseTierUpExperts, false, Normal, "minuteman: print tier-up/deopt expert statistics at exit"_s) \
+    v(OptionString, profileConsumptionLogFile, nullptr, Normal, "minuteman diagnostic: per optimizing compile, the tier and IC/LLInt status source of every inlinee site the parser read (see tools/ProfileConsumptionLog.h). Off by default."_s) \
+    v(OptionString, tierUpOracleFile, nullptr, Normal, "minuteman: exact per-function tier-up timings (see tools/TierUpOracle.h). Off by default."_s) \
+    v(Bool, verboseTierUpOracle, false, Normal, "minuteman: log triggers (requested vs actual count) and jettisons of listed functions"_s) \
+    v(OptionString, tierUpPolicy, nullptr, Normal, "minuteman: online tier-up policy ('hedge'); see tools/TierUpPolicy.h. Off by default."_s) \
+    v(Double, tierUpPolicyEta, 1.0, Normal, "minuteman: Hedge learning rate"_s) \
+    v(Double, tierUpPolicyGamma, 0.99, Normal, "minuteman: Hedge loss discount per loss event"_s) \
+    v(Double, tierUpPolicyEarlyDeoptMs, 50.0, Normal, "minuteman: speculation jettison within this many ms of the tier-up firing counts as early deopt"_s) \
+    v(Double, tierUpPolicyLateM, 5.0, Normal, "minuteman: late-loss threshold on wasted counter units x bytecode size / 1e5"_s) \
+    v(Bool, tierUpPolicyPerClass, false, Normal, "minuteman: separate Hedge state per bytecode-size class"_s) \
+    v(Unsigned, tierUpPolicySeed, 1, Normal, "minuteman: Hedge sampling seed"_s) \
+    v(Bool, verboseTierUpPolicy, false, Normal, "minuteman: print Hedge statistics at exit"_s) \
     v(OptionString, tierUpOverrideFile, nullptr, Normal, "minuteman: file mapping CodeBlock hashes to tier-up overrides (see tools/TierUpOverride.h). Off by default."_s) \
     v(OptionString, ftlAllowlist, nullptr, Normal, "file with newline separated list of function signatures to allow FTL compilation on or, if no such file exists, the function signature to allow"_s) \
     v(OptionString, bbqAllowlist, nullptr, Normal, "file with newline separated list of function indices to allow BBQ compilation on or, if no such file exists, the function index to allow"_s) \

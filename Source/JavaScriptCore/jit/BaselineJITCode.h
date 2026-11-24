@@ -152,9 +152,15 @@ public:
     BaselineExecutionCounter& executeCounter() LIFETIME_BOUND { return m_executeCounter; }
     const BaselineExecutionCounter& executeCounter() const LIFETIME_BOUND { return m_executeCounter; }
 
+    // minuteman (tools/TierUpExperts): calls + loop back-edges executed in this Baseline code,
+    // counted only when the ghost machinery is on (a work unit comparable across tiers).
+    static constexpr ptrdiff_t offsetOfMinutemanWork() { return OBJECT_OFFSETOF(BaselineJITData, m_minutemanWork); }
+    uint64_t minutemanWork() const { return m_minutemanWork; }
+
     JSGlobalObject* m_globalObject { nullptr }; // This is not marked since owner CodeBlock will mark JSGlobalObject.
     intptr_t m_stackOffset { 0 };
     BaselineExecutionCounter m_executeCounter;
+    uint64_t m_minutemanWork { 0 };
 };
 
 } // namespace JSC

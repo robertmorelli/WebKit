@@ -42,6 +42,9 @@ class ConcatKeyAtomStringCache;
 class DateInstance;
 class DirectCallLinkInfo;
 class JSBigInt;
+namespace TierUpExperts {
+struct ExitSiteInfo;
+}
 class JSBoundFunction;
 class JSPropertyNameEnumerator;
 class JSRopeString;
@@ -524,6 +527,7 @@ JSC_DECLARE_JIT_OPERATION(operationUInt64ToBigInt, EncodedJSValue, (JSGlobalObje
 JSC_DECLARE_JIT_OPERATION(operationProcessTypeProfilerLogDFG, void, (VM*));
 
 JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationTriggerReoptimizationNow, void, (CodeBlock* baselineCodeBlock, CodeBlock* optimizedCodeBlock, InlineCallFrame* exitInlineCallFrame));
+JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationMinutemanExitDecision, UCPUStrictInt32, (CodeBlock* optimizedCodeBlock, const TierUpExperts::ExitSiteInfo*));
 
 #if ENABLE(FTL_JIT)
 JSC_DECLARE_NOEXCEPT_JIT_OPERATION(operationTriggerTierUpNow, void, (VM*));

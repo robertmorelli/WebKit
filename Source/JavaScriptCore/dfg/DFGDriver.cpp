@@ -38,6 +38,8 @@
 #include "ThunkGenerators.h"
 #include "TypeProfilerLog.h"
 #include "TierUpOverride.h"
+#include "TierUpPolicy.h"
+#include "TierUpOracle.h"
 #include <wtf/NeverDestroyed.h>
 
 namespace JSC { namespace DFG {
@@ -62,6 +64,15 @@ static CompilationResult compileImpl(
             return CompilationResult::CompilationFailed;
         if (TierUpOverride::isEnabled() && !TierUpOverride::allowsCompile(codeBlock, TierUpOverride::Step::DFG)) [[unlikely]]
             return CompilationResult::CompilationFailed;
+        if (TierUpPolicy::isEnabled()) [[unlikely]]
+            TierUpPolicy::noteTrigger(codeBlock->baselineAlternative(), TierUpPolicy::Step::DFG);
+        if (TierUpOracle::isEnabled()) [[unlikely]] {
+            if (TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::DFG) == TierUpOracle::Never
+                || TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::Baseline) == TierUpOracle::Never)
+                return CompilationResult::CompilationFailed;
+            TierUpOracle::logTrigger(codeBlock->baselineAlternative(), TierUpOracle::Tier::DFG,
+                codeBlock->baselineAlternative()->baselineExecuteCounter().count());
+        }
         break;
     case JITCompilationMode::FTL:
     case JITCompilationMode::FTLForOSREntry:
@@ -70,6 +81,16 @@ static CompilationResult compileImpl(
             return CompilationResult::CompilationFailed;
         if (TierUpOverride::isEnabled() && !TierUpOverride::allowsCompile(codeBlock, TierUpOverride::Step::FTL)) [[unlikely]]
             return CompilationResult::CompilationFailed;
+        if (TierUpPolicy::isEnabled()) [[unlikely]]
+            TierUpPolicy::noteTrigger(codeBlock->baselineAlternative(), TierUpPolicy::Step::FTL);
+        if (TierUpOracle::isEnabled()) [[unlikely]] {
+            if (TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::FTL) == TierUpOracle::Never
+                || TierUpOracle::countFor(codeBlock, TierUpOracle::Tier::DFG) == TierUpOracle::Never
+                || (mode == JITCompilationMode::FTLForOSREntry && !TierUpOracle::osrAllowed(codeBlock)))
+                return CompilationResult::CompilationFailed;
+            TierUpOracle::logTrigger(codeBlock->baselineAlternative(), TierUpOracle::Tier::FTL,
+                profiledDFGCodeBlock ? profiledDFGCodeBlock->dfgJITData()->tierUpCounter().count() : -1);
+        }
         break;
 #else
         [[fallthrough]];

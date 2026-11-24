@@ -112,6 +112,8 @@
 #include "WeakMapImplInlines.h"
 #include "WeakMapPrototype.h"
 #include "WeakSetPrototype.h"
+#include "TierUpOracle.h"
+#include "TierUpExperts.h"
 
 #if ENABLE(JIT)
 #if ENABLE(DFG_JIT)
@@ -6570,6 +6572,12 @@ JSC_DEFINE_JIT_OPERATION(operationLinkDirectCall, void, (DirectCallLinkInfo* cal
     OPERATION_RETURN(scope);
 }
 
+// minuteman deopt experts (see tools/TierUpExperts.h): called from every OSR exit ramp.
+JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationMinutemanExitDecision, UCPUStrictInt32, (CodeBlock* optimizedCodeBlock, const TierUpExperts::ExitSiteInfo* exit))
+{
+    return toUCPUStrictInt32(TierUpExperts::exitDecision(optimizedCodeBlock, exit));
+}
+
 JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerReoptimizationNow, void, (CodeBlock* codeBlock, CodeBlock* optimizedCodeBlock, InlineCallFrame* exitInlineCallFrame))
 {
     // It's sort of preferable that we don't GC while in here. Anyways, doing so wouldn't
@@ -6609,6 +6617,16 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerReoptimizationNow, void, (Code
     // In order to trigger reoptimization, one of two things must have happened:
     // 1) We exited more than some number of times.
     // 2) We exited and got stuck in a loop, and now we're exiting again.
+    if (TierUpExperts::enabled()) [[unlikely]] {
+        // minuteman: the exit ramp already decided (TierUpExperts::exitDecision, which also
+        // computes JSC's own rule below as the jsc-default vote).
+        if (TierUpExperts::takeJettisonRequest(optimizedCodeBlock))
+            optimizedCodeBlock->jettison(Profiler::JettisonDueToOSRExit, CountReoptimization);
+        else
+            codeBlock->optimizeAfterLongWarmUp();
+        return;
+    }
+
     bool didExitABunch = optimizedCodeBlock->shouldReoptimizeNow();
     bool didGetStuckInLoop =
         (codeBlock->checkIfOptimizationThresholdReached() || didTryToEnterIntoInlinedLoops)
@@ -6624,7 +6642,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerReoptimizationNow, void, (Code
 }
 
 #if ENABLE(FTL_JIT)
-static bool shouldTriggerFTLCompile(CodeBlock* codeBlock, JITCode* jitCode)
+static bool shouldTriggerFTLCompile(CodeBlock* codeBlock, JITCode* jitCode, bool fromLoop)
 {
     if (codeBlock->baselineVersion()->m_didFailFTLCompilation) {
         CODEBLOCK_LOG_EVENT(codeBlock, "abortFTLCompile", ());
@@ -6633,7 +6651,15 @@ static bool shouldTriggerFTLCompile(CodeBlock* codeBlock, JITCode* jitCode)
         return false;
     }
 
-    if (!codeBlock->hasOptimizedReplacement() && !jitCode->checkIfOptimizationThresholdReached(codeBlock)) {
+    if (codeBlock->hasOptimizedReplacement())
+        return true;
+    bool reached = jitCode->checkIfOptimizationThresholdReached(codeBlock);
+    // minuteman experts: every DFG tier-up visit that could start a new FTL compile is a
+    // decision point, including visits before JSC's own threshold.
+    if (TierUpExperts::enabled()
+        && JITWorklist::ensureGlobalWorklist().compilationState(codeBlock->vm(), JITCompilationKey(codeBlock->baselineVersion(), JITCompilationMode::FTL)) == JITWorklist::NotKnown) [[unlikely]]
+        reached = TierUpExperts::tierUp(fromLoop ? TierUpExperts::DP::DFGLoopOSR : TierUpExperts::DP::DFGToFTL, codeBlock, reached);
+    if (!reached) {
         CODEBLOCK_LOG_EVENT(codeBlock, "delayFTLCompile", ("counter = ", codeBlock->dfgJITData()->tierUpCounter()));
         dataLogLnIf(Options::verboseOSR(), "Choosing not to FTL-optimize ", *codeBlock, " yet.");
         return false;
@@ -6707,7 +6733,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerTierUpNow, void, (VM* vmPointe
     
     dataLogLnIf(Options::verboseOSR(), *codeBlock, ": Entered triggerTierUpNow with executeCounter = ", codeBlock->dfgJITData()->tierUpCounter());
 
-    if (shouldTriggerFTLCompile(codeBlock, jitCode))
+    if (shouldTriggerFTLCompile(codeBlock, jitCode, false))
         triggerFTLReplacementCompile(vm, codeBlock, jitCode);
 
     if (codeBlock->hasOptimizedReplacement()) {
@@ -6733,6 +6759,8 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerTierUpNow, void, (VM* vmPointe
 static char* tierUpCommon(VM& vm, CallFrame* callFrame, BytecodeIndex originBytecodeIndex, bool canOSREnterHere)
 {
     CodeBlock* codeBlock = callFrame->codeBlock();
+    if (TierUpOracle::isEnabled() && !TierUpOracle::osrAllowed(codeBlock)) [[unlikely]]
+        canOSREnterHere = false;
 
     // Resolve any pending plan for OSR Enter on this function.
     JITWorklist::State worklistState = JITWorklist::ensureGlobalWorklist().completeAllReadyPlansForVM(
@@ -6826,7 +6854,7 @@ static char* tierUpCommon(VM& vm, CallFrame* callFrame, BytecodeIndex originByte
     // - If we do have an FTL code block, then try to enter for a while.
     // - If we couldn't enter for a while, then trigger OSR entry.
 
-    if (!shouldTriggerFTLCompile(codeBlock, jitCode) && !triggeredSlowPathToStartCompilation)
+    if (!shouldTriggerFTLCompile(codeBlock, jitCode, true) && !triggeredSlowPathToStartCompilation)
         return nullptr;
 
     if (!codeBlock->dfgJITData()->neverExecutedEntry() && !triggeredSlowPathToStartCompilation) {
@@ -6975,7 +7003,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerTierUpNowInLoop, void, (VM* vm
 
     if (jitCode->tierUpInLoopHierarchy.contains(bytecodeIndex))
         tierUpCommon(vm, callFrame, bytecodeIndex, false);
-    else if (shouldTriggerFTLCompile(codeBlock, jitCode))
+    else if (shouldTriggerFTLCompile(codeBlock, jitCode, true))
         triggerFTLReplacementCompile(vm, codeBlock, jitCode);
 
     // Since we cannot OSR Enter here, the default "optimizeSoon()" is not useful.

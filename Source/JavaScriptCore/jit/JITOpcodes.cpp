@@ -38,6 +38,7 @@
 #include "JSCast.h"
 #include "JSFunction.h"
 #include "JSPropertyNameEnumerator.h"
+#include "TierUpExperts.h"
 #include "JumpTable.h"
 #include "LinkBuffer.h"
 #include "SuperSampler.h"
@@ -1392,6 +1393,8 @@ void JIT::emit_op_enter(const JSInstruction*)
             store32(argumentGPR2, Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfJITExecuteCounter()));
         }
     }
+    if (TierUpExperts::enabled()) [[unlikely]]
+        add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanWork()));
 #endif
 }
 
@@ -1608,6 +1611,10 @@ void JIT::emit_op_loop_hint(const JSInstruction* instruction)
         storePtr(regT0, ptr);
     }
 
+#if ENABLE(DFG_JIT)
+    if (TierUpExperts::enabled()) [[unlikely]]
+        add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanWork()));
+#endif
     // Emit the JIT optimization check: 
     if (canBeOptimized())
         addSlowCase(branchAdd32(PositiveOrZero, TrustedImm32(Options::executionCounterIncrementForLoop()), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfJITExecuteCounter())));

@@ -1160,7 +1160,13 @@ tools/CellList.cpp
 tools/CharacterPropertyDataGenerator.cpp
 tools/CompilerTimingScope.cpp
 tools/FunctionAllowlist.cpp
+tools/MinutemanCallSiteProfile.cpp
+tools/TierUpOracle.cpp
 tools/TierUpOverride.cpp
+tools/TierUpPolicy.cpp
+tools/TierUpTimeAttribution.cpp
+tools/TierUpExperts.cpp
+tools/ProfileConsumptionLog.cpp
 tools/FunctionOverrides.cpp
 tools/HeapVerifier.cpp
 tools/Integrity.cpp

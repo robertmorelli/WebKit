@@ -2566,6 +2566,11 @@ end
 
 macro commonCallOp(opcodeName, opcodeStruct, prepareCall, invokeCall, prepareSlowCall, prologue, dispatchAfterCall)
     llintOpWithMetadata(opcodeName, opcodeStruct, macro (size, get, dispatch, metadata, return)
+        if MINUTEMAN_CALLSITE_PROFILING
+            # minuteman prototype (separate profiling build only): record this call's argument
+            # types. Placed before any register setup; the slow path returns the same PC.
+            callSlowPath(_llint_slow_path_minuteman_profile_call)
+        end
         metadata(t5, t0)
 
         prologue(macro (fieldName, dst)

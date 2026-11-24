@@ -28,6 +28,7 @@
 
 #include "CodeBlock.h"
 #include "ExecutableAllocator.h"
+#include "TierUpOracle.h"
 #include "VMInlines.h"
 #include <wtf/TZoneMallocInlines.h>
 
@@ -48,6 +49,20 @@ void ExecutionCounter<countingVariant>::forceSlowPathConcurrently()
 template<CountingVariant countingVariant>
 bool ExecutionCounter<countingVariant>::checkIfThresholdCrossedAndSet(CodeBlock* codeBlock)
 {
+    if (TierUpOracle::isEnabled() && codeBlock) [[unlikely]] {
+        // minuteman oracle: exact counts for listed functions. JSC normally declares the
+        // threshold crossed up to half a checkpoint chunk early (and scales it for memory
+        // pressure); for an exact oracle count, crossed means count() >= the armed threshold.
+        TierUpOracle::Tier tier = countingVariant == CountingForUpperTiers ? TierUpOracle::Tier::FTL
+            : codeBlock->jitType() == JITType::BaselineJIT ? TierUpOracle::Tier::DFG : TierUpOracle::Tier::Baseline;
+        if (TierUpOracle::hasExactCount(codeBlock, tier)) {
+            if (count() >= static_cast<double>(m_activeThreshold))
+                return true;
+            setThreshold(nullptr);
+            return false;
+        }
+    }
+
     if (hasCrossedThreshold(codeBlock))
         return true;
     
