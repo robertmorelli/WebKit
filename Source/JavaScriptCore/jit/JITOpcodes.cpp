@@ -1394,8 +1394,7 @@ void JIT::emit_op_enter(const JSInstruction*)
         }
     }
     if (TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_profiledCodeBlock)) [[unlikely]] {
-        add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanWork()));
-        add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanCalls()));
+        add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanCalls())); // D42: entries count calls only
     }
 #endif
 }

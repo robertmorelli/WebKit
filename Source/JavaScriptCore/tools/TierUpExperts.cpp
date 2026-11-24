@@ -130,6 +130,7 @@ struct FnState { // per baseline CodeBlock
     uint64_t ghostFingerprint[2][NumTierExperts] { };
     uint64_t ghostPoint[2][NumTierExperts] { };
     uint8_t waiting[2] { 0, 0 };      // voted Wait at the acted Go and have not re-voted Go since
+    bool disagreed { false };         // D42: awake experts have voted both Go and Wait at some point
     uint8_t waitingAwake[2] { 0, 0 }; // experts awake at that acted Go
     // jettison cost accounting: lower-tier time (ms) by lower tier (0 Baseline, 1 DFG)
     bool installed[2] { false, false };
@@ -164,7 +165,15 @@ struct FnState { // per baseline CodeBlock
     BytecodeIndex retierIndex;
 };
 
+// D39: one site's profile digest
+struct SiteEntry { CodeBlock* codeBlock; unsigned offset; uint64_t digest; };
+
 struct OptState { // per optimized CodeBlock
+    // D42: whether this optimized code counts work (decided at its first codegen query)
+    bool countDecided { false };
+    bool counts { true };
+    // D39: per-site digests of the function and its inlinees when this code was installed
+    Vector<SiteEntry> installSites;
     // (profiled CodeBlock, kind/bytecode/operand key) -> prediction the compile consumed
     HashMap<std::pair<CodeBlock*, uint64_t>, SpeculatedType> consumed;
     bool refuted { false };
@@ -223,6 +232,8 @@ uint64_t s_mixerChose[NumTierExperts] { };
 double s_latencySumMs[2] { 0, 0 };
 uint64_t s_latencyN[2] { 0, 0 };
 uint64_t s_lateSkippedInFlight { 0 }, s_lateSkippedLatency { 0 };
+uint64_t s_jettisonsAttributable { 0 }, s_jettisonsNotAttributable { 0 }; // D39
+uint64_t s_optimizedCounted { 0 }, s_optimizedNotCounted { 0 }; // D42
 uint64_t s_mixerOverIncumbent[static_cast<unsigned>(DP::Count)][2] { }; // [dp][0: Go over Wait, 1: Wait over Go]
 uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 }, s_majorityOverrodeJsc { 0 };
 // queue-wait measurement per compile tier: plans, plans that arrived behind >= 1 / >= 2 plans,
@@ -352,6 +363,9 @@ void closePendingEarly(FnState& st, unsigned step, CodeBlock* baseline = nullptr
                 // D27: the acted Go paid this; awake Wait voters avoided it.
                 else if (Options::tierUpMixerRelative() && (st.pendingAwake[step] & (1 << e)) && (s_mix & (1 << e)))
                     chargeFaster(baseline, st, step, e, part.pair, -part.ms);
+                // D40: scores relative to jsc-default at the expert's awake points.
+                if (Options::tierUpMixerRelativeToJsc() && (st.pendingYes[step] & (1 << TJsc)) && (st.pendingAwake[step] & (1 << e)) && (s_mix & (1 << e)))
+                    chargeFaster(baseline, st, step, e, part.pair, -part.ms);
             }
         }
         if (priced) {
@@ -406,15 +420,16 @@ std::optional<double> gapMedian() WTF_REQUIRES_LOCK(s_lock)
 // 1 DFG, 2 FTL.
 uint64_t countedOf(CodeBlock* baseline, FnState& st, unsigned tierIndex, bool calls) WTF_REQUIRES_LOCK(s_lock)
 {
+    // D42: [0] / minutemanWork count back-edges only, [1] / minutemanCalls calls; work = both.
     if (!tierIndex) {
         auto* jitData = baseline->baselineJITData();
-        return jitData ? (calls ? jitData->minutemanCalls() : jitData->minutemanWork()) : 0;
+        return jitData ? (calls ? jitData->minutemanCalls() : jitData->minutemanWork() + jitData->minutemanCalls()) : 0;
     }
-    uint64_t w = calls ? st.retiredCalls[tierIndex - 1] : st.retiredWork[tierIndex - 1];
+    uint64_t w = st.retiredCalls[tierIndex - 1] + (calls ? 0 : st.retiredWork[tierIndex - 1]);
     for (CodeBlock* optimized : st.liveOptimized) {
         auto it = s_opt->find(optimized);
         if (it != s_opt->end() && it->value->work && it->value->workTier == tierIndex - 1)
-            w += it->value->work[calls ? 1 : 0];
+            w += it->value->work[1] + (calls ? 0 : it->value->work[0]);
     }
     return w;
 }
@@ -453,10 +468,11 @@ std::optional<double> onlineSpeedup(CodeBlock* baseline, FnState& st, unsigned p
 {
     constexpr unsigned pairs[3][2] = { { 0, 1 }, { 0, 2 }, { 1, 2 } };
     unsigned lo = pairs[p][0], hi = pairs[p][1];
-    uint64_t wlo = workOf(baseline, st, lo), whi = workOf(baseline, st, hi);
+    bool globalOnly = Options::tierUpGhostSpeedupGlobalOnly(); // D37: one run-wide ratio per pair
+    uint64_t wlo = globalOnly ? 0 : workOf(baseline, st, lo), whi = globalOnly ? 0 : workOf(baseline, st, hi);
     if (st.sampleMs[lo] > 0 && wlo && st.sampleMs[hi] > 0 && whi)
         return (st.sampleMs[lo] / wlo) / (st.sampleMs[hi] / whi);
-    for (unsigned c : { static_cast<unsigned>(std::max<int8_t>(st.functionClass, 0)), 4u }) {
+    for (unsigned c : { globalOnly ? 4u : static_cast<unsigned>(std::max<int8_t>(st.functionClass, 0)), 4u }) {
         const double* a = s_onlineAgg[c][p];
         if (a[0] > 0 && a[1] > 0 && a[2] > 0 && a[3] > 0)
             return (a[0] / a[1]) / (a[2] / a[3]);
@@ -622,13 +638,14 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
     unsigned fromFunction = 0, fromClass = 0, fromGlobal = 0, missing = 0;
     auto speedup = [&](const Record& r, unsigned p) -> std::optional<double> {
         unsigned lo = pairs[p][0], hi = pairs[p][1];
-        if (r.ms[lo] > 0 && r.work[lo] && r.ms[hi] > 0 && r.work[hi]) {
+        bool globalOnly = Options::tierUpGhostSpeedupGlobalOnly(); // D37
+        if (!globalOnly && r.ms[lo] > 0 && r.work[lo] && r.ms[hi] > 0 && r.work[hi]) {
             fromFunction++;
             return (r.ms[lo] / r.work[lo]) / (r.ms[hi] / r.work[hi]);
         }
         // Fallbacks, all from this run: the function's class, then every function.
         unsigned c = cls(r);
-        if (classMs[c][p][0] > 0 && classMs[c][p][1] > 0) {
+        if (!globalOnly && classMs[c][p][0] > 0 && classMs[c][p][1] > 0) {
             fromClass++;
             return (classMs[c][p][0] / classWork[c][p][0]) / (classMs[c][p][1] / classWork[c][p][1]);
         }
@@ -751,7 +768,7 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
     dataLog("tierUpExperts: ghostRegretMs interval=", intervalMs(), " functions=", records.size(),
         " earlyEvents=", earlyEvents, " syntheticEvents=", syntheticEvents, " syntheticUnpriced=", syntheticUnpriced,
         " unpricedMs=", unpricedMs, " speedupFromFunction=", fromFunction, " fromClass=", fromClass, " fromGlobal=", fromGlobal, " missing=", missing,
-        " reevaluations=", s_stats.reevaluations, " lateSkippedInFlight=", s_lateSkippedInFlight, " lateSkippedLatency=", s_lateSkippedLatency,
+        " reevaluations=", s_stats.reevaluations, " optimizedCounted=", s_optimizedCounted, "/", s_optimizedCounted + s_optimizedNotCounted, " jettisonsAttributable=", s_jettisonsAttributable, "/", s_jettisonsAttributable + s_jettisonsNotAttributable, " lateSkippedInFlight=", s_lateSkippedInFlight, " lateSkippedLatency=", s_lateSkippedLatency,
         " meanLatencyMs=", s_latencyN[0] ? s_latencySumMs[0] / s_latencyN[0] : 0.0, "/", s_latencyN[1] ? s_latencySumMs[1] / s_latencyN[1] : 0.0);
     for (unsigned e = 0; e < NumTierExperts; ++e) {
         double own = late[e] + delayed[e] + early[e] + synthetic[e];
@@ -1462,8 +1479,18 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
             s_stats.deoptVotes[DCauseSplit][r][retier]++;
         }
 
-        for (unsigned e = 0; e < NumTierExperts; ++e)
-            s_stats.tierVotes[e][dpi][v[e]]++;
+        {
+            bool anyYes = false, anyNo = false;
+            for (unsigned e = 0; e < NumTierExperts; ++e) {
+                s_stats.tierVotes[e][dpi][v[e]]++;
+                if (inMix[e] || e == TJsc) {
+                    anyYes |= v[e] == Yes;
+                    anyNo |= v[e] == No;
+                }
+            }
+            if (anyYes && anyNo)
+                st.disagreed = true;
+        }
         if (!lb)
             st.latestLoop[ftl ? 1 : 0] = isLoopDP(dp);
         if (mixerOn()) {
@@ -1707,7 +1734,24 @@ void noteOptimizedInstalled(CodeBlock* machine)
         }
     }
     CodeBlock* baseline = baselineOf(machine);
+    // D39: snapshot the per-site digests the compile saw (outside s_lock: takes CodeBlock locks).
+    Vector<SiteEntry> sites;
+    if (Options::tierUpGhostExitAttribution()) {
+        Vector<CodeBlock*> blocks { baseline };
+        for (CodeBlock* b : inlined) {
+            if (!blocks.contains(b))
+                blocks.append(b);
+        }
+        for (CodeBlock* b : blocks) {
+            Vector<std::pair<unsigned, uint64_t>> digests;
+            b->minutemanSiteDigests(digests);
+            for (auto& [offset, digest] : digests)
+                sites.append({ b, offset, digest });
+        }
+    }
     Locker locker { s_lock };
+    if (!sites.isEmpty())
+        optState(machine).installSites = WTF::move(sites);
     {
         FnState& st = fnState(baseline);
         classOf(baseline, st);
@@ -1743,8 +1787,44 @@ void noteJettison(CodeBlock* optimized, Profiler::JettisonReason reason)
     CodeBlock* baseline = baselineOf(optimized);
     uint64_t tick = TierUpTimeAttribution::currentTick();
     bool rearm = false;
+    // D39: the sites of the exits this code took, and their digests now (outside s_lock).
+    Vector<SiteEntry> exitSites;
+    bool attribute = Options::tierUpGhostExitAttribution() && Profiler::isSpeculationFailure(reason);
+    if (attribute) {
+        Vector<std::pair<CodeBlock*, BytecodeIndex>> taken;
+        optimized->minutemanTakenExitSites(taken);
+        for (auto& [block, index] : taken) {
+            if (block)
+                exitSites.append({ block, index.offset(), block->minutemanSiteDigest(index) });
+        }
+    }
     {
         Locker locker { s_lock };
+        // D39: a jettison is attributable to compiling too early only if one of its exit sites'
+        // profile changed after install (waiting would have seen it). No recorded exits, or a site
+        // missing from the snapshot: attributable (unknown counts against the compile).
+        bool attributable = true;
+        if (attribute) {
+            auto o = s_opt->find(optimized);
+            const Vector<SiteEntry>* snapshot = o != s_opt->end() ? &o->value->installSites : nullptr;
+            if (snapshot && !snapshot->isEmpty() && !exitSites.isEmpty()) {
+                attributable = false;
+                for (auto& site : exitSites) {
+                    bool found = false;
+                    for (auto& entry : *snapshot) {
+                        if (entry.codeBlock == site.codeBlock && entry.offset == site.offset) {
+                            found = true;
+                            attributable |= entry.digest != site.digest;
+                            break;
+                        }
+                    }
+                    attributable |= !found;
+                    if (attributable)
+                        break;
+                }
+            }
+            (attributable ? s_jettisonsAttributable : s_jettisonsNotAttributable)++;
+        }
         FnState& st = fnState(baseline);
         st.lastJettisonTickPlusOne = tick + 1;
         st.lastJettison = MonotonicTime::now();
@@ -1753,7 +1833,7 @@ void noteJettison(CodeBlock* optimized, Profiler::JettisonReason reason)
         unsigned si = optimized->jitType() == JITType::FTLJIT ? 1 : 0;
         if (Profiler::isSpeculationFailure(reason)) {
             st.requireChange = true;
-            if (st.compileYesMask[si] && !st.pendingEarly[si]) {
+            if (st.compileYesMask[si] && !st.pendingEarly[si] && attributable) {
                 // Its cost: the exits' lower-tier time while installed, plus the lower-tier time
                 // from now until the function re-tiers (closed at the next install at this step).
                 st.pendingEarly[si] = true;
@@ -1804,7 +1884,8 @@ void noteSample(CodeBlock* root, unsigned tier)
             continue;
         if (st->installed[si])
             st->installedLowerMs[si][t] += ms;
-        if (st->pendingEarly[si])
+        // D38: with --tierUpGhostEarlyServiceTime only while the replacement compile is in flight.
+        if (st->pendingEarly[si] && (!Options::tierUpGhostEarlyServiceTime() || st->inFlight[si]))
             st->pendingLowerMs[si][t] += ms;
     }
     // Late: a Baseline sample scores step 0, a DFG sample step 1, against the latest votes.
@@ -1834,8 +1915,11 @@ void noteSample(CodeBlock* root, unsigned tier)
                     && mixerOn() && (s_mix & (1 << e)))
                     chargeFaster(root, *st, si, e, si ? 2 : 0, -ms); // D27: the acted Wait paid this
 
-                if (st->latest[si][TJsc] == No && (st->latestAwake[si] & (1 << e)))
+                if (st->latest[si][TJsc] == No && (st->latestAwake[si] & (1 << e))) {
                     st->raw.lateJsc[si][e] += ms;
+                    if (Options::tierUpMixerRelativeToJsc() && mixerOn() && (s_mix & (1 << e)))
+                        chargeFaster(root, *st, si, e, si ? 2 : 0, -ms); // D40
+                }
             }
         }
     }
@@ -1851,8 +1935,11 @@ void noteSample(CodeBlock* root, unsigned tier)
                 if (mixerOn() && (s_mix & (1 << e)))
                     chargeSlower(root, *st, si, e, si ? 2 : (h ? 1 : 0), ms);
             }
-            if ((st->waiting[si] & (1 << TJsc)) && (st->waitingAwake[si] & (1 << e)))
+            if ((st->waiting[si] & (1 << TJsc)) && (st->waitingAwake[si] & (1 << e))) {
                 st->raw.delayedJsc[si][h][e] += ms;
+                if (Options::tierUpMixerRelativeToJsc() && mixerOn() && (s_mix & (1 << e)))
+                    chargeSlower(root, *st, si, e, si ? 2 : (h ? 1 : 0), -ms); // D40
+            }
         }
     }
 }
@@ -1869,6 +1956,22 @@ void noteQueueWait(unsigned tier, double waitMs, unsigned ahead, size_t)
     q.waits1ms += waitMs >= 1;
     q.waitMs += waitMs;
     q.maxWaitMs = std::max(q.maxWaitMs, waitMs);
+}
+
+bool countsOptimizedWork(CodeBlock* machine)
+{
+    if (!Options::tierUpExpertsCountOnlyDisagreed())
+        return true;
+    CodeBlock* baseline = baselineOf(machine);
+    Locker locker { s_lock };
+    OptState& os = optState(machine);
+    if (!os.countDecided) {
+        os.countDecided = true;
+        FnState* st = findFnState(baseline);
+        os.counts = st && st->disagreed;
+        (os.counts ? s_optimizedCounted : s_optimizedNotCounted)++;
+    }
+    return os.counts;
 }
 
 bool isWorkCounted(CodeBlock* codeBlock)

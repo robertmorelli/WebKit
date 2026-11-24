@@ -754,6 +754,12 @@ public:
     // array profiles and inline-cache states (megamorphic caches excluded). Same walk as the
     // prediction update JSC performs at its tier-up checks; call after updatePredictionsConcurrently().
     uint64_t minutemanProfileFingerprint();
+    // minuteman (D39): per-site profile digests (value prediction, array modes, inline-cache state)
+    // of this baseline block, as (bytecode offset, digest) in offset order; and, for optimized code,
+    // the (baseline block, bytecode index) of every OSR exit taken so far (its exit stubs).
+    void minutemanSiteDigests(Vector<std::pair<unsigned, uint64_t>>&);
+    uint64_t minutemanSiteDigest(BytecodeIndex);
+    void minutemanTakenExitSites(Vector<std::pair<CodeBlock*, BytecodeIndex>>&);
     void updateAllArrayAllocationProfilePredictions();
     void updateAllPredictions();
     void updatePredictionsConcurrently();

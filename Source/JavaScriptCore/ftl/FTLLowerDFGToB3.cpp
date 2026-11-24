@@ -256,8 +256,7 @@ public:
 
                     AllowMacroScratchRegisterUsage allowScratch(jit);
                     if (minutemanWork) {
-                        jit.add64(CCallHelpers::TrustedImm32(1), CCallHelpers::AbsoluteAddress(minutemanWork));
-                        jit.add64(CCallHelpers::TrustedImm32(1), CCallHelpers::AbsoluteAddress(minutemanWork + 1)); // calls (D35)
+                        jit.add64(CCallHelpers::TrustedImm32(1), CCallHelpers::AbsoluteAddress(minutemanWork + 1)); // calls (D35); D42: [0] back-edges only
                     }
 
                     // Stack overflow check before frame allocation.
@@ -28562,7 +28561,7 @@ IGNORE_CLANG_WARNINGS_END
     // minuteman (tools/TierUpExperts): this compile's work counter (calls + loop back-edges),
     // when the ghost machinery is on.
     B3::Variable* m_minutemanLoopVar { nullptr };
-    uint64_t* m_minutemanWork { TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock) ? TierUpExperts::workCounterFor(m_graph.m_codeBlock, true) : nullptr };
+    uint64_t* m_minutemanWork { TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock) && TierUpExperts::countsOptimizedWork(m_graph.m_codeBlock) ? TierUpExperts::workCounterFor(m_graph.m_codeBlock, true) : nullptr };
     State& m_ftlState;
     Procedure& m_proc;
     AbstractHeapRepository& m_heaps;

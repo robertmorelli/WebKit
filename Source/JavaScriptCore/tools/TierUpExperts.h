@@ -138,6 +138,10 @@ void forget(CodeBlock*);
 // by that factor; other functions are priced with their class's or the run's speedup.
 // --tierUpExpertsWorkCountedOneIn (default 8; 1 = every function).
 bool isWorkCounted(CodeBlock*);
+// D42 (step 5): whether optimized code being compiled emits work counters: with
+// --tierUpExpertsCountOnlyDisagreed only if the experts have disagreed on this function at some
+// decision point before this compile (decided once per optimized CodeBlock; compiler thread).
+bool countsOptimizedWork(CodeBlock* machine);
 // Queue-wait measurement (D17): a plan of compile tier `tier` (0 Baseline, 1 DFG, 2 FTL) left the
 // queue after `waitMs`; `ahead` plans were queued or compiling in its tier when it arrived, and
 // `stillQueued` remain queued behind it.

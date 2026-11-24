@@ -169,6 +169,7 @@ bool hasCapacityToUseLargeGigacage();
     v(Bool, tierUpExpertsWorkCountersCallsOnly, false, Normal, "minuteman: work counters count calls only, not loop back-edges (overhead measurement only)"_s) \
     v(Bool, tierUpExpertsNoWorkCounters, false, Normal, "minuteman: do not emit the experts' work counters (overhead measurement only)"_s) \
     v(OptionString, tierUpMixerRule, nullptr, Normal, "minuteman mixer action: argmax (default) or weighted-majority"_s) \
+    v(Bool, tierUpMixerRelativeToJsc, false, Normal, "minuteman mixer: score each expert by its loss minus jsc-default's at its awake points (jsc-default stays at 0), D40"_s) \
     v(Bool, tierUpMixerPrior, false, Normal, "minuteman mixer: start newcomers (not jsc-default, not the incumbent) at log-weight -ln(n), together one incumbent (D36)"_s) \
     v(Bool, tierUpMixerRelative, false, Normal, "minuteman mixer: sleeping-experts update relative to the acted decision (credit awake experts for losses the acted decision paid)"_s) \
     v(Bool, tierUpMixerShadow, false, Normal, "minuteman mixer diagnostic: compute and update weights, but act on the incumbent's vote"_s) \
@@ -176,9 +177,13 @@ bool hasCapacityToUseLargeGigacage();
     v(OptionString, tierUpMixerIncumbent, nullptr, Normal, "minuteman mixer: the expert whose vote stands on exact ties (default jsc-default)"_s) \
     v(OptionString, tierUpMixerPool, nullptr, Normal, "minuteman mixer evidence pooling: bucket (default) or hierarchy (global + class + bucket)"_s) \
     v(Unsigned, tierUpExpertsWorkCountedOneIn, 8, Normal, "minuteman: emit work counters for 1 in N functions (by source position)"_s) \
+    v(Bool, tierUpExpertsCountOnlyDisagreed, false, Normal, "minuteman: DFG/FTL code counts work only for functions the experts have disagreed on before the compile (D42)"_s) \
     v(Bool, tierUpExpertsFTLNoInLoopFlush, false, Normal, "minuteman diagnostic: FTL loop counts flushed only at returns and tail calls"_s) \
     v(Bool, tierUpExpertsDumpWork, false, Normal, "minuteman diagnostic: print each function's work counts per tier at exit"_s) \
     v(Unsigned, tierUpExpertsLoopCounterTiers, 3, Normal, "minuteman: tiers that count loop back-edges (1 Baseline, 2 DFG, 4 FTL); without FTL, FTL work = FTL calls x lower-tier work per call (D35)"_s) \
+    v(Bool, tierUpGhostExitAttribution, false, Normal, "minuteman ghost pricing: charge a jettison as an early loss only if one of its exit sites' profile digest changed after install (D39)"_s) \
+    v(Bool, tierUpGhostEarlyServiceTime, false, Normal, "minuteman ghost pricing: after a jettison, charge lower-tier time only while the replacement compile is in flight (D38)"_s) \
+    v(Bool, tierUpGhostSpeedupGlobalOnly, false, Normal, "minuteman ghost pricing: one run-wide speedup per tier pair (no per-function or per-class speedups), D37"_s) \
     v(Bool, tierUpGhostNoSynthetic, false, Normal, "minuteman: ghost scoring without synthetic losses (no profile-fingerprint snapshots)"_s) \
     v(OptionString, tierUpMixExperts, nullptr, Normal, "minuteman: comma-separated tier-up experts that compute votes (lean build); unset = all"_s) \
     v(OptionString, deoptExpert, nullptr, Normal, "minuteman: jettison expert: jsc-default, rate-based, quarantine, mixer (see tools/TierUpExperts.h). Off by default."_s) \

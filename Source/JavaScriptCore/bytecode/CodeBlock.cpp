@@ -3090,6 +3090,89 @@ uint64_t CodeBlock::minutemanProfileFingerprint()
     return h;
 }
 
+static uint64_t minutemanDigestOf(CodeBlock* codeBlock, BytecodeIndex index, uint64_t icPart)
+{
+    uint64_t h = icPart * 0x165667b19e3779f9ull;
+    if (auto* valueProfile = codeBlock->tryGetValueProfileForBytecodeIndex(index))
+        h ^= (static_cast<uint64_t>(valueProfile->m_prediction) + 1) * 0x9e3779b97f4a7c15ull;
+    if (auto* arrayProfile = codeBlock->getArrayProfile(index)) {
+        uint64_t modes = static_cast<uint64_t>(arrayProfile->observedArrayModes()) ^ (arrayProfile->outOfBounds() ? 1ull << 62 : 0) ^ (arrayProfile->mayStoreToHole() ? 1ull << 61 : 0);
+        h ^= (modes + 1) * 0xc2b2ae3d27d4eb4full;
+    }
+    return h;
+}
+
+void CodeBlock::minutemanSiteDigests(Vector<std::pair<unsigned, uint64_t>>& out)
+{
+    HashMap<unsigned, uint64_t, WTF::IntHash<unsigned>, WTF::UnsignedWithZeroKeyHashTraits<unsigned>> ics;
+#if ENABLE(JIT)
+    if (auto* jitData = baselineJITData()) {
+        ConcurrentJSLocker locker(m_lock);
+        for (auto& cache : jitData->propertyInlineCaches()) {
+            PropertyInlineCacheSummary summary = PropertyInlineCache::summary(locker, vm(), &cache);
+            ics.add(cache.codeOrigin.bytecodeIndex().offset(), 0).iterator->value ^= (static_cast<uint64_t>(summary) << 8) ^ static_cast<uint64_t>(cache.cacheType()) ^ 0x100000;
+        }
+    }
+#endif
+    for (const auto& instruction : instructions()) {
+        BytecodeIndex index(instruction.offset());
+        auto ic = ics.find(instruction.offset());
+        uint64_t d = minutemanDigestOf(this, index, ic == ics.end() ? 0 : ic->value);
+        if (d)
+            out.append({ instruction.offset(), d });
+    }
+}
+
+uint64_t CodeBlock::minutemanSiteDigest(BytecodeIndex index)
+{
+    uint64_t icPart = 0;
+#if ENABLE(JIT)
+    if (auto* jitData = baselineJITData()) {
+        ConcurrentJSLocker locker(m_lock);
+        for (auto& cache : jitData->propertyInlineCaches()) {
+            if (cache.codeOrigin.bytecodeIndex().offset() != index.offset())
+                continue;
+            PropertyInlineCacheSummary summary = PropertyInlineCache::summary(locker, vm(), &cache);
+            icPart ^= (static_cast<uint64_t>(summary) << 8) ^ static_cast<uint64_t>(cache.cacheType()) ^ 0x100000;
+        }
+    }
+#endif
+    return minutemanDigestOf(this, BytecodeIndex(index.offset()), icPart);
+}
+
+void CodeBlock::minutemanTakenExitSites(Vector<std::pair<CodeBlock*, BytecodeIndex>>& out)
+{
+#if ENABLE(DFG_JIT)
+    CodeBlock* profiledBlock = alternative();
+    if (!profiledBlock)
+        return;
+    auto add = [&](const DFG::OSRExitBase& exit) {
+        const CodeOrigin& origin = exit.m_codeOriginForExitProfile;
+        out.append({ baselineCodeBlockForOriginAndBaselineCodeBlock(origin, profiledBlock), BytecodeIndex(origin.bytecodeIndex().offset()) });
+    };
+    switch (jitType()) {
+    case JITType::DFGJIT:
+        if (auto* jitData = dfgJITData()) {
+            for (auto& stub : jitData->exitStubs())
+                add(m_jitCode->dfg()->m_osrExits.at(stub.exitIndex));
+        }
+        break;
+#if ENABLE(FTL_JIT)
+    case JITType::FTLJIT: {
+        auto* jitCode = m_jitCode->ftl();
+        for (auto& stub : jitCode->m_osrExitStubs)
+            add(jitCode->osrExit(stub.exitIndex));
+        break;
+    }
+#endif
+    default:
+        break;
+    }
+#else
+    UNUSED_PARAM(out);
+#endif
+}
+
 void CodeBlock::updateAllArrayAllocationProfilePredictions()
 {
     forEachArrayAllocationProfile([&](ArrayAllocationProfile& profile) {

@@ -151,10 +151,9 @@ void JITCompiler::compileEntry()
     // check) which will be dependent on stack layout. (We'd need to account for this in
     // both normal return code and when jumping to an exception handler).
     emitFunctionPrologue();
-    if (TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock)) [[unlikely]] {
+    if (TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock) && TierUpExperts::countsOptimizedWork(m_graph.m_codeBlock)) [[unlikely]] {
         uint64_t* counter = TierUpExperts::workCounterFor(m_graph.m_codeBlock, false);
-        add64(TrustedImm32(1), AbsoluteAddress(counter));
-        add64(TrustedImm32(1), AbsoluteAddress(counter + 1)); // calls (D35)
+        add64(TrustedImm32(1), AbsoluteAddress(counter + 1)); // calls (D35); D42: [0] counts back-edges only
     }
     jitAssertCodeBlockOnCallFrameWithType(GPRInfo::regT2, JITType::DFGJIT);
     if (m_graph.m_codeBlock->couldBeTainted())
