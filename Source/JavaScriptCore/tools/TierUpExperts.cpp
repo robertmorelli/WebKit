@@ -98,7 +98,7 @@ struct EdgeState {
     bool deferred[kSupplySlots] { };
     unsigned nextSlot { 0 };
     bool pulled { false };
-    HashSet<CodeBlock*> trackedBy; // callers whose slots hold this function
+    Vector<CodeBlock*, 2> trackedBy; // callers whose slots hold this function (no duplicates)
 };
 
 struct FnState { // per baseline CodeBlock
@@ -140,6 +140,14 @@ struct FnState { // per baseline CodeBlock
     RawLoss raw;
     // dfg-probe: the DFG code block seen at the previous DFG->FTL visit and its OSR exit count then
     CodeBlock* probeOwner { nullptr };
+    // mixer (D23): whether this function's most recent decision point at each step was a loop point
+    bool latestLoop[2] { false, false };
+    // late-loss timing (D25): a real compile at this step is queued or compiling; when it was
+    // requested; since when the latest votes have contained a Go (episode start)
+    bool inFlight[2] { false, false };
+    Vote latestActed[2] { Abstain, Abstain }; // the acted vote at the most recent decision (D27)
+    MonotonicTime goActedAt[2];
+    MonotonicTime goSince[2];
     uint32_t probeExits { 0 };
     double sampleMs[3] { };             // this function's sampled ms in Baseline / DFG / FTL
     uint64_t retiredWork[2] { 0, 0 };   // work of destroyed DFG / FTL code for this function
@@ -204,11 +212,17 @@ Vector<Record>* s_retired;
 // mixer; --tierUpMixerPool=hierarchy decides on the sum of all three (D12).
 double s_logGlobal[NumTierExperts] { };
 double s_logClass[4][NumTierExperts] { };
-double s_logBucket[4][2][NumTierExperts] { };
+// [class][step * 2 + loop][e]; loop = 0 unless --tierUpMixerSplitLoop (D23)
+double s_logBucket[4][4][NumTierExperts] { };
 bool s_poolHierarchy { false };
 bool s_weightedMajority { false };
 unsigned s_incumbent { 0 }; // the expert whose vote stands on exact ties (D18; default jsc-default)
 uint64_t s_mixerChose[NumTierExperts] { };
+// D25: in-run Go-to-install latency of real compiles per step (sum ms, count)
+double s_latencySumMs[2] { 0, 0 };
+uint64_t s_latencyN[2] { 0, 0 };
+uint64_t s_lateSkippedInFlight { 0 }, s_lateSkippedLatency { 0 };
+uint64_t s_mixerOverIncumbent[static_cast<unsigned>(DP::Count)][2] { }; // [dp][0: Go over Wait, 1: Wait over Go]
 uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 }, s_majorityOverrodeJsc { 0 };
 // queue-wait measurement per compile tier: plans, plans that arrived behind >= 1 / >= 2 plans,
 // total wait ms, waits >= 1 ms, max wait ms
@@ -334,6 +348,9 @@ void closePendingEarly(FnState& st, unsigned step, CodeBlock* baseline = nullptr
             for (unsigned e = 0; e < NumTierExperts; ++e) {
                 if ((st.pendingYes[step] & (1 << e)) && (s_mix & (1 << e)))
                     chargeFaster(baseline, st, step, e, part.pair, part.ms);
+                // D27: the acted Go paid this; awake Wait voters avoided it.
+                else if (Options::tierUpMixerRelative() && (st.pendingAwake[step] & (1 << e)) && (s_mix & (1 << e)))
+                    chargeFaster(baseline, st, step, e, part.pair, -part.ms);
             }
         }
         if (priced) {
@@ -455,11 +472,12 @@ void refreshOnlineAggregates() WTF_REQUIRES_LOCK(s_lock)
 // `ms` extra time; one unit = one sampling interval (the analogue of one cache miss).
 void chargeWeight(FnState& st, unsigned step, unsigned e, double ms) WTF_REQUIRES_LOCK(s_lock)
 {
-    if (!mixerOn() || !(s_mix & (1 << e)) || !(ms > 0))
+    // ms < 0 is a sleeping-experts credit (D27): the acted decision paid a loss this expert avoided.
+    if (!mixerOn() || !(s_mix & (1 << e)) || !ms)
         return;
     unsigned c = std::max<int8_t>(st.functionClass, 0);
     double delta = -kLearningRate * ms / intervalMs();
-    s_logBucket[c][step][e] += delta;
+    s_logBucket[c][step * 2 + (Options::tierUpMixerSplitLoop() && st.latestLoop[step])][e] += delta;
     s_logClass[c][e] += delta;
     s_logGlobal[e] += delta;
     s_weightUpdates++;
@@ -469,9 +487,10 @@ void chargeWeight(FnState& st, unsigned step, unsigned e, double ms) WTF_REQUIRE
 // ms x (1 - 1/s). Deferred if the speedup is not known yet.
 void chargeFaster(CodeBlock* baseline, FnState& st, unsigned step, unsigned e, unsigned p, double ms) WTF_REQUIRES_LOCK(s_lock)
 {
-    if (auto sp = onlineSpeedup(baseline, st, p))
-        chargeWeight(st, step, e, ms * (1 - 1 / *sp));
-    else {
+    if (auto sp = onlineSpeedup(baseline, st, p)) {
+        if (*sp > 1)
+            chargeWeight(st, step, e, ms * (1 - 1 / *sp));
+    } else {
         st.pendingFaster[step][p][e] += ms;
         st.hasPending = true;
         s_unpricedUpdates++;
@@ -481,9 +500,10 @@ void chargeFaster(CodeBlock* baseline, FnState& st, unsigned step, unsigned e, u
 // Charge `ms` of higher-tier time that the lower tier would have taken longer: ms x (s - 1).
 void chargeSlower(CodeBlock* baseline, FnState& st, unsigned step, unsigned e, unsigned p, double ms) WTF_REQUIRES_LOCK(s_lock)
 {
-    if (auto sp = onlineSpeedup(baseline, st, p))
-        chargeWeight(st, step, e, ms * (*sp - 1));
-    else {
+    if (auto sp = onlineSpeedup(baseline, st, p)) {
+        if (*sp > 1)
+            chargeWeight(st, step, e, ms * (*sp - 1));
+    } else {
         st.pendingSlower[step][p][e] += ms;
         st.hasPending = true;
         s_unpricedUpdates++;
@@ -517,8 +537,10 @@ void applyPending() WTF_REQUIRES_LOCK(s_lock)
                         left = true;
                         continue;
                     }
-                    chargeWeight(*st, step, e, st->pendingFaster[step][p][e] * (1 - 1 / *sp));
-                    chargeWeight(*st, step, e, st->pendingSlower[step][p][e] * (*sp - 1));
+                    if (*sp > 1) {
+                        chargeWeight(*st, step, e, st->pendingFaster[step][p][e] * (1 - 1 / *sp));
+                        chargeWeight(*st, step, e, st->pendingSlower[step][p][e] * (*sp - 1));
+                    }
                     st->pendingFaster[step][p][e] = st->pendingSlower[step][p][e] = 0;
                 }
             }
@@ -712,7 +734,8 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
     dataLog("tierUpExperts: ghostRegretMs interval=", intervalMs(), " functions=", records.size(),
         " earlyEvents=", earlyEvents, " syntheticEvents=", syntheticEvents, " syntheticUnpriced=", syntheticUnpriced,
         " unpricedMs=", unpricedMs, " speedupFromFunction=", fromFunction, " fromClass=", fromClass, " fromGlobal=", fromGlobal, " missing=", missing,
-        " reevaluations=", s_stats.reevaluations);
+        " reevaluations=", s_stats.reevaluations, " lateSkippedInFlight=", s_lateSkippedInFlight, " lateSkippedLatency=", s_lateSkippedLatency,
+        " meanLatencyMs=", s_latencyN[0] ? s_latencySumMs[0] / s_latencyN[0] : 0.0, "/", s_latencyN[1] ? s_latencySumMs[1] / s_latencyN[1] : 0.0);
     for (unsigned e = 0; e < NumTierExperts; ++e) {
         double own = late[e] + delayed[e] + early[e] + synthetic[e];
         dataLog(" | ", kTierNames[e], " late/delayed/early/synthetic=", late[e], "/", delayed[e], "/", early[e], "/", synthetic[e],
@@ -744,9 +767,15 @@ void dump()
         for (unsigned e = 0; e < NumTierExperts; ++e)
             dataLog(" ", kTierNames[e], "=", s_mixerChose[e]);
         dataLogLn();
+        dataLog("tierUpExperts: mixer overrides incumbent (go-over-wait/wait-over-go):");
+        for (unsigned d = 0; d < static_cast<unsigned>(DP::Count); ++d)
+            dataLog(" ", d, "=", s_mixerOverIncumbent[d][0], "/", s_mixerOverIncumbent[d][1]);
+        dataLogLn();
         for (unsigned c = 0; c < 4; ++c) {
-            for (unsigned st = 0; st < 2; ++st) {
-                dataLog("tierUpExperts: mixer logWeights class=", c, " step=", st);
+            for (unsigned st = 0; st < 4; ++st) {
+                if ((st & 1) && !Options::tierUpMixerSplitLoop())
+                    continue;
+                dataLog("tierUpExperts: mixer logWeights class=", c, " step=", st / 2, " loop=", st & 1);
                 for (unsigned e = 0; e < NumTierExperts; ++e) {
                     if (s_mix & (1 << e))
                         dataLog(" ", kTierNames[e], "=", s_logBucket[c][st][e]);
@@ -997,7 +1026,7 @@ void forget(CodeBlock* codeBlock)
         }
         for (CodeBlock* callee : es.slots) {
             if (EdgeState* c = callee ? findEdgeState(callee) : nullptr)
-                c->trackedBy.remove(codeBlock);
+                c->trackedBy.removeFirst(codeBlock);
         }
         s_edges->remove(e);
     }
@@ -1208,6 +1237,22 @@ void scoreDecision(CodeBlock* baseline, unsigned si, const Vote* v, Vote acted, 
     }
     st.latestAwake[si] = awake;
     st.haveLatest[si] = true;
+    st.latestActed[si] = acted;
+    // A decision point at this step is visited only when no compile at this step is in flight.
+    st.inFlight[si] = false;
+    {
+        bool anyGo = false;
+        for (unsigned e = 0; e < NumTierExperts; ++e)
+            anyGo |= v[e] == Yes;
+        if (!anyGo)
+            st.goSince[si] = MonotonicTime();
+        else if (!st.goSince[si])
+            st.goSince[si] = MonotonicTime::now();
+    }
+    if (acted == Yes) {
+        st.inFlight[si] = true;
+        st.goActedAt[si] = MonotonicTime::now();
+    }
 
     if (acted == Yes) {
         uint8_t yes = 0, wait = 0;
@@ -1382,11 +1427,13 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
 
         for (unsigned e = 0; e < NumTierExperts; ++e)
             s_stats.tierVotes[e][dpi][v[e]]++;
+        if (!lb)
+            st.latestLoop[ftl ? 1 : 0] = isLoopDP(dp);
         if (mixerOn()) {
             unsigned c = classOf(baseline, st);
             unsigned si = ftl ? 1 : 0;
             auto score = [&](unsigned e) {
-                double l = s_logBucket[c][si][e];
+                double l = s_logBucket[c][si * 2 + (Options::tierUpMixerSplitLoop() && isLoopDP(dp))][e];
                 if (s_poolHierarchy)
                     l += s_logClass[c][e] + s_logGlobal[e];
                 return l;
@@ -1418,6 +1465,10 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
                 // Exact tie: the incumbent's vote (jsc-default if the incumbent abstains).
                 Vote tie = (inMix[s_incumbent] && v[s_incumbent] != Abstain) ? v[s_incumbent] : v[TJsc];
                 acted = go > wait ? Yes : wait > go ? No : tie;
+                if (Vote inc = v[s_incumbent] == Abstain ? v[TJsc] : v[s_incumbent]; acted != inc)
+                    s_mixerOverIncumbent[dpi][acted == Yes ? 0 : 1]++;
+                if (Options::tierUpMixerShadow()) // diagnostic (D24): weights computed, incumbent acts
+                    acted = v[s_incumbent] == Abstain ? v[TJsc] : v[s_incumbent];
                 if (acted != v[TJsc])
                     s_majorityOverrodeJsc++;
             }
@@ -1599,11 +1650,11 @@ void noteIncomingCall(CodeBlock* callee, JSCell* caller)
     unsigned i = c.nextSlot++ % kSupplySlots;
     if (CodeBlock* old = c.slots[i]) {
         if (EdgeState* o = findEdgeState(old))
-            o->trackedBy.remove(callerBaseline);
+            o->trackedBy.removeFirst(callerBaseline);
     }
     c.slots[i] = callee;
     c.deferred[i] = false;
-    edgeState(callee).trackedBy.add(callerBaseline);
+    edgeState(callee).trackedBy.appendIfNotContains(callerBaseline);
 }
 
 void noteOptimizedInstalled(CodeBlock* machine)
@@ -1625,6 +1676,12 @@ void noteOptimizedInstalled(CodeBlock* machine)
         classOf(baseline, st);
         // Re-tiered: a jettison at this step is closed with the time it cost.
         closePendingEarly(st, tier, baseline);
+        if (st.inFlight[tier]) {
+            s_latencySumMs[tier] += (MonotonicTime::now() - st.goActedAt[tier]).milliseconds();
+            s_latencyN[tier]++;
+            st.inFlight[tier] = false;
+        }
+        st.goSince[tier] = MonotonicTime(); // the episode ends with the install
         st.installed[tier] = true;
         st.installedLowerMs[tier][0] = st.installedLowerMs[tier][1] = 0;
         if (tier == 1)
@@ -1719,13 +1776,27 @@ void noteSample(CodeBlock* root, unsigned tier)
         bool anyGo = false;
         for (unsigned e = 0; e < NumTierExperts; ++e)
             anyGo |= st->latest[si][e] == Yes;
+        // D25: a Go voter's compile helps only once it could have been installed: no late loss
+        // while a real compile at this step is in flight, nor within the run's mean Go-to-install
+        // latency after the episode's first Go vote.
+        if (anyGo && st->inFlight[si]) {
+            anyGo = false;
+            s_lateSkippedInFlight++;
+        } else if (anyGo && s_latencyN[si] && st->goSince[si]
+            && (MonotonicTime::now() - st->goSince[si]).milliseconds() < s_latencySumMs[si] / s_latencyN[si]) {
+            anyGo = false;
+            s_lateSkippedLatency++;
+        }
         if (anyGo) {
             for (unsigned e = 0; e < NumTierExperts; ++e) {
                 if (st->latest[si][e] == No) {
                     st->raw.late[si][e] += ms;
                     if (mixerOn() && (s_mix & (1 << e)))
                         chargeFaster(root, *st, si, e, si ? 2 : 0, ms);
-                }
+                } else if (st->latest[si][e] == Yes && st->latestActed[si] == No && Options::tierUpMixerRelative()
+                    && mixerOn() && (s_mix & (1 << e)))
+                    chargeFaster(root, *st, si, e, si ? 2 : 0, -ms); // D27: the acted Wait paid this
+
                 if (st->latest[si][TJsc] == No && (st->latestAwake[si] & (1 << e)))
                     st->raw.lateJsc[si][e] += ms;
             }
@@ -1765,6 +1836,8 @@ void noteQueueWait(unsigned tier, double waitMs, unsigned ahead, size_t)
 
 bool isWorkCounted(CodeBlock* codeBlock)
 {
+    if (Options::tierUpExpertsWorkCountedOneIn() <= 1)
+        return true; // every function: skip the source-position lookup (it allocates)
     ScriptExecutable* executable = codeBlock->ownerExecutable();
     unsigned position = (static_cast<unsigned>(executable->firstLine()) << 12) ^ static_cast<unsigned>(executable->startColumn());
     return !(WTF::intHash(position) % std::max(1u, Options::tierUpExpertsWorkCountedOneIn()));

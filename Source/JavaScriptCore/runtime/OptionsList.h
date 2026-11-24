@@ -169,6 +169,9 @@ bool hasCapacityToUseLargeGigacage();
     v(Bool, tierUpExpertsWorkCountersCallsOnly, false, Normal, "minuteman: work counters count calls only, not loop back-edges (overhead measurement only)"_s) \
     v(Bool, tierUpExpertsNoWorkCounters, false, Normal, "minuteman: do not emit the experts' work counters (overhead measurement only)"_s) \
     v(OptionString, tierUpMixerRule, nullptr, Normal, "minuteman mixer action: argmax (default) or weighted-majority"_s) \
+    v(Bool, tierUpMixerRelative, false, Normal, "minuteman mixer: sleeping-experts update relative to the acted decision (credit awake experts for losses the acted decision paid)"_s) \
+    v(Bool, tierUpMixerShadow, false, Normal, "minuteman mixer diagnostic: compute and update weights, but act on the incumbent's vote"_s) \
+    v(Bool, tierUpMixerSplitLoop, false, Normal, "minuteman mixer: separate weight buckets for loop OSR-entry and function-entry decisions"_s) \
     v(OptionString, tierUpMixerIncumbent, nullptr, Normal, "minuteman mixer: the expert whose vote stands on exact ties (default jsc-default)"_s) \
     v(OptionString, tierUpMixerPool, nullptr, Normal, "minuteman mixer evidence pooling: bucket (default) or hierarchy (global + class + bucket)"_s) \
     v(Unsigned, tierUpExpertsWorkCountedOneIn, 8, Normal, "minuteman: emit work counters for 1 in N functions (by source position)"_s) \
