@@ -55,11 +55,11 @@ namespace {
 constexpr unsigned kSupplySlots = 4;          // Caller-Pull: tracked cold inlinable callees per caller
 constexpr double kEwmaWeight = 1.0 / 8;       // Queue-Slack: Jacobson's TCP RTT gain
 
-enum TierExpert : unsigned { TJsc, TSupply, TQuiescence, TSampleGravity, TQueueSlack, NumTierExperts };
+enum TierExpert : unsigned { TJsc, TSupply, TQuiescence, TSampleGravity, TQueueSlack, TDfgProbe, TTierInversion, NumTierExperts };
 enum DeoptExpert : unsigned { DJsc, DRefutation, DCauseSplit, NumDeoptExperts };
 enum Vote : uint8_t { Abstain = 0, Yes = 1, No = 2 }; // Yes = Go / Jettison, No = Wait / Keep
 
-const char* const kTierNames[] = { "jsc-default", "supply", "quiescence", "sample-gravity", "queue-slack", "mixer" };
+const char* const kTierNames[] = { "jsc-default", "supply", "quiescence", "sample-gravity", "queue-slack", "dfg-probe", "tier-inversion", "mixer" };
 const char* const kDeoptNames[] = { "jsc-default", "refutation", "cause-split" };
 const char* const kDPNames[] = { "LLIntToBaseline", "BaselineToDFG", "BaselineLoopOSR", "DFGToFTL", "DFGLoopOSR", "Retier", "Exit", "LoopReoptimize" };
 
@@ -82,22 +82,26 @@ struct EarlyEvent {
 };
 
 struct RawLoss {
-    double late[2][5] { };          // lower-tier ms while waiting after some expert voted Go
-    double lateJsc[2][5] { };
-    double delayed[2][2][5] { };    // [step][higher tier: DFG, FTL][e] higher-tier ms while still waiting
-    double delayedJsc[2][2][5] { };
+    double late[2][NumTierExperts] { };          // lower-tier ms while waiting after some expert voted Go
+    double lateJsc[2][NumTierExperts] { };
+    double delayed[2][2][NumTierExperts] { };    // [step][higher tier: DFG, FTL][e] higher-tier ms while still waiting
+    double delayedJsc[2][2][NumTierExperts] { };
     Vector<EarlyEvent> early;
-    unsigned synthetic[2][5] { };   // superseded un-acted Go votes
-    unsigned syntheticJsc[2][5] { };
+    unsigned synthetic[2][NumTierExperts] { };   // superseded un-acted Go votes
+    unsigned syntheticJsc[2][NumTierExperts] { };
 };
 
-struct FnState { // per baseline CodeBlock
-    // supply
+// Call-edge state (Supply and tier-inversion), kept apart from FnState so a call link does not
+// allocate a full FnState (2136 bytes) for caller and callee (D21).
+struct EdgeState {
     CodeBlock* slots[kSupplySlots] { };
     bool deferred[kSupplySlots] { };
     unsigned nextSlot { 0 };
     bool pulled { false };
     HashSet<CodeBlock*> trackedBy; // callers whose slots hold this function
+};
+
+struct FnState { // per baseline CodeBlock
     // quiescence
     uint64_t fingerprint { 0 };
     bool haveFingerprint { false };
@@ -112,19 +116,19 @@ struct FnState { // per baseline CodeBlock
     // ((B,D), (B,F), (D,F)) per expert, for (1 - 1/s) losses and (s - 1) losses; unpriced
     // synthetic votes per step per expert. Multiplicative updates commute, so deferral loses
     // only timeliness.
-    double pendingFaster[2][3][5] { }; // [step][pair][expert]
-    double pendingSlower[2][3][5] { };
-    unsigned pendingSynthetic[2][5] { };
+    double pendingFaster[2][3][NumTierExperts] { }; // [step][pair][expert]
+    double pendingSlower[2][3][NumTierExperts] { };
+    unsigned pendingSynthetic[2][NumTierExperts] { };
     bool hasPending { false };
     // ---- ghost scoring. Step si: 0 = Baseline->DFG, 1 = DFG->FTL. Tier index t: 0 Baseline, 1 DFG, 2 FTL.
-    Vote latest[2][5] { };          // each tier-up expert's vote at the most recent decision point
+    Vote latest[2][NumTierExperts] { };          // each tier-up expert's vote at the most recent decision point
     uint8_t latestAwake[2] { 0, 0 }; // experts awake (not abstaining) at that point
     bool haveLatest[2] { false, false };
     uint8_t compileYesMask[2] { 0, 0 };   // at the acted Go: experts that voted Go
     uint8_t compileAwakeMask[2] { 0, 0 }; // at the acted Go: experts awake
-    bool ghostActive[2][5] { };     // voted Go while the acted decision was Wait
-    uint64_t ghostFingerprint[2][5] { };
-    uint64_t ghostPoint[2][5] { };
+    bool ghostActive[2][NumTierExperts] { };     // voted Go while the acted decision was Wait
+    uint64_t ghostFingerprint[2][NumTierExperts] { };
+    uint64_t ghostPoint[2][NumTierExperts] { };
     uint8_t waiting[2] { 0, 0 };      // voted Wait at the acted Go and have not re-voted Go since
     uint8_t waitingAwake[2] { 0, 0 }; // experts awake at that acted Go
     // jettison cost accounting: lower-tier time (ms) by lower tier (0 Baseline, 1 DFG)
@@ -134,6 +138,9 @@ struct FnState { // per baseline CodeBlock
     uint8_t pendingYes[2] { 0, 0 }, pendingAwake[2] { 0, 0 };
     double pendingLowerMs[2][2] { };    // the above, plus lower-tier time since the jettison
     RawLoss raw;
+    // dfg-probe: the DFG code block seen at the previous DFG->FTL visit and its OSR exit count then
+    CodeBlock* probeOwner { nullptr };
+    uint32_t probeExits { 0 };
     double sampleMs[3] { };             // this function's sampled ms in Baseline / DFG / FTL
     uint64_t retiredWork[2] { 0, 0 };   // work of destroyed DFG / FTL code for this function
     HashSet<CodeBlock*> liveOptimized;  // optimized CodeBlocks with a work counter
@@ -188,6 +195,7 @@ struct Record {
 
 Lock s_lock;
 HashMap<CodeBlock*, std::unique_ptr<FnState>>* s_fn;
+HashMap<CodeBlock*, std::unique_ptr<EdgeState>>* s_edges;
 HashMap<CodeBlock*, std::unique_ptr<OptState>>* s_opt;
 Stats s_stats;
 Vector<Record>* s_retired;
@@ -199,6 +207,7 @@ double s_logClass[4][NumTierExperts] { };
 double s_logBucket[4][2][NumTierExperts] { };
 bool s_poolHierarchy { false };
 bool s_weightedMajority { false };
+unsigned s_incumbent { 0 }; // the expert whose vote stands on exact ties (D18; default jsc-default)
 uint64_t s_mixerChose[NumTierExperts] { };
 uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 }, s_majorityOverrodeJsc { 0 };
 // queue-wait measurement per compile tier: plans, plans that arrived behind >= 1 / >= 2 plans,
@@ -227,6 +236,20 @@ FnState* findFnState(CodeBlock* baseline) WTF_REQUIRES_LOCK(s_lock)
 {
     auto it = s_fn->find(baseline);
     return it == s_fn->end() ? nullptr : it->value.get();
+}
+
+EdgeState* findEdgeState(CodeBlock* baseline) WTF_REQUIRES_LOCK(s_lock)
+{
+    auto it = s_edges->find(baseline);
+    return it == s_edges->end() ? nullptr : it->value.get();
+}
+
+EdgeState& edgeState(CodeBlock* baseline) WTF_REQUIRES_LOCK(s_lock)
+{
+    auto& p = s_edges->add(baseline, nullptr).iterator->value;
+    if (!p)
+        p = std::make_unique<EdgeState>();
+    return *p;
 }
 
 FnState& fnState(CodeBlock* baseline) WTF_REQUIRES_LOCK(s_lock)
@@ -891,6 +914,7 @@ void initialize(VM& vm)
         return;
     s_vm = &vm;
     s_fn = new HashMap<CodeBlock*, std::unique_ptr<FnState>>();
+    s_edges = new HashMap<CodeBlock*, std::unique_ptr<EdgeState>>();
     s_opt = new HashMap<CodeBlock*, std::unique_ptr<OptState>>();
     s_retired = new Vector<Record>();
     s_waiters = new HashSet<CodeBlock*>();
@@ -926,6 +950,16 @@ void initialize(VM& vm)
     RELEASE_ASSERT_WITH_MESSAGE(pool.isNull() || pool == "bucket"_s || pool == "hierarchy"_s, "tierUpExperts: --tierUpMixerPool=bucket|hierarchy");
     RELEASE_ASSERT_WITH_MESSAGE(rule.isNull() || rule == "argmax"_s || rule == "weighted-majority"_s, "tierUpExperts: --tierUpMixerRule=argmax|weighted-majority");
     s_poolHierarchy = pool == "hierarchy"_s;
+    if (const char8_t* inc = Options::tierUpMixerIncumbent()) {
+        bool known = false;
+        for (unsigned e = 0; e < NumTierExperts; ++e) {
+            if (!strcmp(reinterpret_cast<const char*>(inc), kTierNames[e])) {
+                s_incumbent = e;
+                known = true;
+            }
+        }
+        RELEASE_ASSERT_WITH_MESSAGE(known, "tierUpExperts: unknown --tierUpMixerIncumbent");
+    }
     s_weightedMajority = rule == "weighted-majority"_s;
     g_deoptEnabled = !!d;
     found = !d;
@@ -951,25 +985,25 @@ void shutdown(VM& vm)
 void forget(CodeBlock* codeBlock)
 {
     Locker locker { s_lock };
+    if (auto e = s_edges->find(codeBlock); e != s_edges->end()) {
+        EdgeState& es = *e->value;
+        for (CodeBlock* caller : es.trackedBy) {
+            if (EdgeState* c = findEdgeState(caller)) {
+                for (auto& slot : c->slots) {
+                    if (slot == codeBlock)
+                        slot = nullptr;
+                }
+            }
+        }
+        for (CodeBlock* callee : es.slots) {
+            if (EdgeState* c = callee ? findEdgeState(callee) : nullptr)
+                c->trackedBy.remove(codeBlock);
+        }
+        s_edges->remove(e);
+    }
     auto it = s_fn->find(codeBlock);
     if (it != s_fn->end()) {
         FnState& st = *it->value;
-        for (CodeBlock* caller : st.trackedBy) {
-            auto c = s_fn->find(caller);
-            if (c == s_fn->end())
-                continue;
-            for (auto& slot : c->value->slots) {
-                if (slot == codeBlock)
-                    slot = nullptr;
-            }
-        }
-        for (CodeBlock* callee : st.slots) {
-            if (!callee)
-                continue;
-            auto c = s_fn->find(callee);
-            if (c != s_fn->end())
-                c->value->trackedBy.remove(codeBlock);
-        }
         for (CodeBlock* inlinee : st.inlinees) {
             if (FnState* i = findFnState(inlinee))
                 i->inlinedInto.remove(codeBlock);
@@ -999,6 +1033,34 @@ void forget(CodeBlock* codeBlock)
 }
 
 // ---------------------------------------------------------------- tier-up
+// tier-inversion (D20): Go iff a tracked inlinable callee (Supply's call-edge slots) already runs
+// at or above the target tier (DFG at step 0, FTL at step 1); never Wait.
+Vote tierInversionVote(EdgeState* es, bool ftl) WTF_REQUIRES_LOCK(s_lock)
+{
+    if (!es)
+        return Abstain;
+    unsigned budget = inlineBudget(ftl);
+    for (unsigned i = 0; i < kSupplySlots; ++i) {
+        CodeBlock* callee = es->slots[i];
+        if (!callee || callee->bytecodeCost() > budget)
+            continue;
+        CodeBlock* replacement = callee->replacement();
+        JITType t = replacement ? replacement->jitType() : callee->jitType();
+        if (ftl ? t == JITType::FTLJIT : (t == JITType::DFGJIT || t == JITType::FTLJIT))
+            return Yes;
+    }
+    return Abstain;
+}
+
+// dfg-probe (D20): at DFG->FTL, Go iff the DFG code's OSR exit count is unchanged since this
+// function's previous DFG->FTL visit with the same DFG code; Wait if it rose; abstain otherwise.
+Vote dfgProbeVote(FnState& st, CodeBlock* dfg)
+{
+    if (!dfg || dfg->jitType() != JITType::DFGJIT || st.probeOwner != dfg)
+        return Abstain;
+    return dfg->osrExitCounter() == st.probeExits ? Yes : No;
+}
+
 // The pure (state-preserving) vote of tier-up expert `e` on `function` at step `si`, used to
 // re-evaluate experts that voted Wait at an acted Go. jsc-default's rule is a counter crossing,
 // which cannot be re-asked once the function has compiled: a waiting jsc-default stays waiting.
@@ -1007,14 +1069,17 @@ Vote pureVote(unsigned e, unsigned si, CodeBlock* function, FnState& st, uint64_
 {
     switch (e) {
     case TSupply: {
+        EdgeState* es = findEdgeState(function);
+        if (!es)
+            return Abstain;
         unsigned budget = inlineBudget(si == 1);
         bool tracked = false;
         for (unsigned i = 0; i < kSupplySlots; ++i) {
-            CodeBlock* callee = st.slots[i];
+            CodeBlock* callee = es->slots[i];
             if (!callee || callee->bytecodeCost() > budget)
                 continue;
             tracked = true;
-            if (!st.deferred[i] && isThin(callee))
+            if (!es->deferred[i] && isThin(callee))
                 return No;
         }
         return tracked ? Yes : Abstain;
@@ -1029,6 +1094,10 @@ Vote pureVote(unsigned e, unsigned si, CodeBlock* function, FnState& st, uint64_
     }
     case TSampleGravity:
         return heavy && top != JITType::FTLJIT ? Yes : No;
+    case TDfgProbe:
+        return si == 1 ? dfgProbeVote(st, function->replacement()) : Abstain;
+    case TTierInversion:
+        return tierInversionVote(findEdgeState(function), si == 1);
     case TQueueSlack: {
         UNUSED_PARAM(tick);
         bool recentJettison = st.lastJettison && (now - st.lastJettison).milliseconds() < 20;
@@ -1217,21 +1286,24 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         v[TJsc] = jscGo ? Yes : No;
 
         // supply
+        EdgeState* es = findEdgeState(baseline); // unique_ptr values: stable across map growth
         if (!inMix[TSupply])
             v[TSupply] = Abstain;
         else if (lb)
-            v[TSupply] = st.pulled ? Yes : Abstain;
+            v[TSupply] = es && es->pulled ? Yes : Abstain;
+        else if (!isLoopDP(dp) && !es)
+            v[TSupply] = Abstain;
         else if (!isLoopDP(dp)) {
             unsigned budget = inlineBudget(ftl);
             bool tracked = false;
             for (unsigned i = 0; i < kSupplySlots && v[TSupply] != No; ++i) {
-                CodeBlock* callee = st.slots[i];
+                CodeBlock* callee = es->slots[i];
                 if (!callee || callee->bytecodeCost() > budget)
                     continue;
                 tracked = true;
-                if (!st.deferred[i] && isThin(callee)) {
-                    st.deferred[i] = true;
-                    fnState(callee).pulled = true;
+                if (!es->deferred[i] && isThin(callee)) {
+                    es->deferred[i] = true;
+                    edgeState(callee).pulled = true;
                     pullTarget = callee;
                     v[TSupply] = No;
                 }
@@ -1279,6 +1351,20 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
             }
         }
 
+        // dfg-probe: DFG->FTL only (owner is the DFG code block)
+        if (inMix[TDfgProbe]) {
+            if (dp == DP::DFGToFTL) {
+                v[TDfgProbe] = dfgProbeVote(st, owner);
+                st.probeOwner = owner;
+                st.probeExits = owner->osrExitCounter();
+            } else
+                v[TDfgProbe] = Abstain;
+        }
+
+        // tier-inversion: function-entry points only
+        if (inMix[TTierInversion])
+            v[TTierInversion] = (!lb && !isLoopDP(dp)) ? tierInversionVote(es, ftl) : Abstain;
+
         // cause-split retier (deopt family)
         bool isRetier = st.retierPending && (dp == DP::BaselineToDFG || dp == DP::BaselineLoopOSR);
         if (isRetier) {
@@ -1308,8 +1394,8 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
             if (!s_weightedMajority) {
                 // D5: the awake expert in the mix with the largest weight acts (ties: jsc-default,
                 // then lower index).
-                unsigned chosen = TJsc;
-                for (unsigned e = 1; e < NumTierExperts; ++e) {
+                unsigned chosen = (inMix[s_incumbent] && v[s_incumbent] != Abstain) ? s_incumbent : TJsc;
+                for (unsigned e = 0; e < NumTierExperts; ++e) {
                     if (inMix[e] && v[e] != Abstain && score(e) > score(chosen))
                         chosen = e;
                 }
@@ -1329,7 +1415,9 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
                         continue;
                     (v[e] == Yes ? go : wait) += std::exp(score(e) - top);
                 }
-                acted = go > wait ? Yes : wait > go ? No : v[TJsc];
+                // Exact tie: the incumbent's vote (jsc-default if the incumbent abstains).
+                Vote tie = (inMix[s_incumbent] && v[s_incumbent] != Abstain) ? v[s_incumbent] : v[TJsc];
+                acted = go > wait ? Yes : wait > go ? No : tie;
                 if (acted != v[TJsc])
                     s_majorityOverrodeJsc++;
             }
@@ -1347,8 +1435,8 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         if (acted == Yes) {
             if (isRetier)
                 st.retierPending = false;
-            if (lb)
-                st.pulled = false;
+            if (lb && es)
+                es->pulled = false;
         }
         s_stats.acted[dpi][acted]++;
         if ((acted == Yes) != jscGo)
@@ -1494,8 +1582,8 @@ bool loopReoptimize(CodeBlock* optimized, bool jscJettison)
 // ---------------------------------------------------------------- observations
 void noteIncomingCall(CodeBlock* callee, JSCell* caller)
 {
-    if (!(s_mix & (1 << TSupply)))
-        return; // call edges feed only Supply
+    if (!(s_mix & ((1 << TSupply) | (1 << TTierInversion))))
+        return; // call edges feed only Supply and tier-inversion
     CodeBlock* callerCodeBlock = dynamicDowncast<CodeBlock>(caller);
     if (!callerCodeBlock || callerCodeBlock == callee)
         return;
@@ -1503,20 +1591,19 @@ void noteIncomingCall(CodeBlock* callee, JSCell* caller)
         return;
     CodeBlock* callerBaseline = baselineOf(callerCodeBlock);
     Locker locker { s_lock };
-    FnState& c = fnState(callerBaseline);
+    EdgeState& c = edgeState(callerBaseline);
     for (CodeBlock* slot : c.slots) {
         if (slot == callee)
             return;
     }
     unsigned i = c.nextSlot++ % kSupplySlots;
     if (CodeBlock* old = c.slots[i]) {
-        auto o = s_fn->find(old);
-        if (o != s_fn->end())
-            o->value->trackedBy.remove(callerBaseline);
+        if (EdgeState* o = findEdgeState(old))
+            o->trackedBy.remove(callerBaseline);
     }
     c.slots[i] = callee;
     c.deferred[i] = false;
-    fnState(callee).trackedBy.add(callerBaseline);
+    edgeState(callee).trackedBy.add(callerBaseline);
 }
 
 void noteOptimizedInstalled(CodeBlock* machine)
@@ -1567,6 +1654,8 @@ void noteJettison(CodeBlock* optimized, Profiler::JettisonReason reason)
         FnState& st = fnState(baseline);
         st.lastJettisonTickPlusOne = tick + 1;
         st.lastJettison = MonotonicTime::now();
+        if (st.probeOwner == optimized)
+            st.probeOwner = nullptr; // dfg-probe: a later DFG block may reuse this address
         unsigned si = optimized->jitType() == JITType::FTLJIT ? 1 : 0;
         if (Profiler::isSpeculationFailure(reason)) {
             st.requireChange = true;
