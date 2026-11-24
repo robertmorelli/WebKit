@@ -158,6 +158,7 @@ bool hasCapacityToUseLargeGigacage();
     v(OptionRange, bytecodeRangeToFTLCompile, nullptr, Normal, "bytecode size range to allow FTL compilation on, e.g. 1:100"_s) \
     v(OptionString, jitAllowlist, nullptr, Normal, "file with newline separated list of function signatures to allow compilation on or, if no such file exists, the function signature to allow"_s) \
     v(OptionString, dfgAllowlist, nullptr, Normal, "file with newline separated list of function signatures to allow DFG compilation on or, if no such file exists, the function signature to allow"_s) \
+    v(OptionString, tierUpOverrideFile, nullptr, Normal, "minuteman: file mapping CodeBlock hashes to tier-up overrides (see tools/TierUpOverride.h). Off by default."_s) \
     v(OptionString, ftlAllowlist, nullptr, Normal, "file with newline separated list of function signatures to allow FTL compilation on or, if no such file exists, the function signature to allow"_s) \
     v(OptionString, bbqAllowlist, nullptr, Normal, "file with newline separated list of function indices to allow BBQ compilation on or, if no such file exists, the function index to allow"_s) \
     v(OptionString, omgAllowlist, nullptr, Normal, "file with newline separated list of function indices to allow OMG compilation on or, if no such file exists, the function index to allow"_s) \

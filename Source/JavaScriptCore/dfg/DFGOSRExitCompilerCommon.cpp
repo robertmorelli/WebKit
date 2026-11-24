@@ -36,6 +36,7 @@
 #include "LLIntData.h"
 #include "LLIntThunks.h"
 #include "PropertyInlineCache.h"
+#include "TierUpOverride.h"
 
 namespace JSC { namespace DFG {
 
@@ -116,9 +117,11 @@ void handleExitCounts(VM& vm, CCallHelpers& jit, const OSRExitBase& exit)
     doneAdjusting.append(jit.branchTestPtr(CCallHelpers::Zero, GPRInfo::regT5));
 
     // Adjust the execution counter such that the target is to only optimize after a while.
+    int32_t longWarmUpThreshold = Options::thresholdForOptimizeAfterLongWarmUp();
+    if (TierUpOverride::isEnabled()) [[unlikely]]
+        longWarmUpThreshold = TierUpOverride::adjustThreshold(jit.baselineCodeBlock(), TierUpOverride::Step::DFG, longWarmUpThreshold);
     int32_t activeThreshold =
-        jit.baselineCodeBlock()->adjustedCounterValue(
-            Options::thresholdForOptimizeAfterLongWarmUp());
+        jit.baselineCodeBlock()->adjustedCounterValue(longWarmUpThreshold);
     int32_t targetValue = applyMemoryUsageHeuristicsAndConvertToInt(
         activeThreshold, jit.baselineCodeBlock());
     int32_t clippedValue;

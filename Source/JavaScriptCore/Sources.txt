@@ -1160,6 +1160,7 @@ tools/CellList.cpp
 tools/CharacterPropertyDataGenerator.cpp
 tools/CompilerTimingScope.cpp
 tools/FunctionAllowlist.cpp
+tools/TierUpOverride.cpp
 tools/FunctionOverrides.cpp
 tools/HeapVerifier.cpp
 tools/Integrity.cpp

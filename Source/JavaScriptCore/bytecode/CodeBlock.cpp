@@ -87,6 +87,7 @@
 #include <wtf/SimpleStats.h>
 #include <wtf/StringPrintStream.h>
 #include <wtf/text/UniquedStringImpl.h>
+#include "TierUpOverride.h"
 
 #if ENABLE(ASSEMBLER)
 #include "RegisterAtOffsetList.h"
@@ -800,6 +801,13 @@ bool CodeBlock::finishCreation(VM& vm, ScriptExecutable* ownerExecutable, Unlink
 
     initializeTemplateObjects(topLevelExecutable, templateObjectIndices);
     RETURN_IF_EXCEPTION(throwScope, false);
+
+    if (TierUpOverride::isEnabled()) [[unlikely]] {
+        int32_t threshold = Options::thresholdForJITAfterWarmUp();
+        int32_t adjusted = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::Baseline, threshold);
+        if (adjusted != threshold)
+            m_unlinkedCode->llintExecuteCounter().setNewThreshold(m_unlinkedCode->thresholdForJIT(adjusted), this);
+    }
 
     return true;
 }
@@ -2650,6 +2658,8 @@ void CodeBlock::optimizeAfterWarmUpImpl()
                 dataLogLnIf(Options::verboseOSR(), *this, ": Quick DFG tier-up enabled and code is stable, bytecodeCost=", bytecodeCost(), ", codeType=", codeType(), ", adjustedThreshold=", threshold, ", finalThreshold=", adjustedCounterValue(threshold), " optimizationDelayCounter=", m_optimizationDelayCounter);
             }
         }
+        if (TierUpOverride::isEnabled()) [[unlikely]]
+            threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::DFG, threshold);
         jitData->executeCounter().setNewThreshold(adjustedCounterValue(threshold), this);
     }
 #endif
@@ -2664,8 +2674,12 @@ void CodeBlock::optimizeAfterLongWarmUp()
 {
     dataLogLnIf(Options::verboseOSR(), *this, ": Optimizing after long warm-up.");
 #if ENABLE(DFG_JIT)
-    if (auto* jitData = baselineJITData())
-        jitData->executeCounter().setNewThreshold(adjustedCounterValue(Options::thresholdForOptimizeAfterLongWarmUp()), this);
+    if (auto* jitData = baselineJITData()) {
+        int32_t threshold = Options::thresholdForOptimizeAfterLongWarmUp();
+        if (TierUpOverride::isEnabled()) [[unlikely]]
+            threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::DFG, threshold);
+        jitData->executeCounter().setNewThreshold(adjustedCounterValue(threshold), this);
+    }
 #endif
 }
 
@@ -2673,8 +2687,12 @@ void CodeBlock::optimizeSoon()
 {
     dataLogLnIf(Options::verboseOSR(), *this, ": Optimizing soon.");
 #if ENABLE(DFG_JIT)
-    if (auto* jitData = baselineJITData())
-        jitData->executeCounter().setNewThreshold(adjustedCounterValue(Options::thresholdForOptimizeSoon()), this);
+    if (auto* jitData = baselineJITData()) {
+        int32_t threshold = Options::thresholdForOptimizeSoon();
+        if (TierUpOverride::isEnabled()) [[unlikely]]
+            threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::DFG, threshold);
+        jitData->executeCounter().setNewThreshold(adjustedCounterValue(threshold), this);
+    }
 #endif
 }
 
@@ -3594,7 +3612,10 @@ bool CodeBlock::checkIfJITThresholdReached()
 
 void CodeBlock::jitSoon()
 {
-    m_unlinkedCode->llintExecuteCounter().setNewThreshold(unlinkedCodeBlock()->thresholdForJIT(Options::thresholdForJITSoon()), this);
+    int32_t threshold = Options::thresholdForJITSoon();
+    if (TierUpOverride::isEnabled()) [[unlikely]]
+        threshold = TierUpOverride::adjustThreshold(this, TierUpOverride::Step::Baseline, threshold);
+    m_unlinkedCode->llintExecuteCounter().setNewThreshold(unlinkedCodeBlock()->thresholdForJIT(threshold), this);
 }
 
 void CodeBlock::jitNextInvocation()

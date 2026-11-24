@@ -36,6 +36,7 @@
 #include "FTLCapabilities.h"
 #include "FunctionAllowlist.h"
 #include "JSCJSValueInlines.h"
+#include "TierUpOverride.h"
 #include <wtf/NeverDestroyed.h>
 
 namespace JSC { namespace DFG {
@@ -64,6 +65,9 @@ public:
 
 #if ENABLE(FTL_JIT)
         if (!ensureGlobalFTLAllowlist().contains(m_graph.m_profiledBlock))
+            return false;
+
+        if (TierUpOverride::isEnabled() && !TierUpOverride::allowsCompile(m_graph.m_profiledBlock, TierUpOverride::Step::FTL)) [[unlikely]]
             return false;
 
         FTL::CapabilityLevel level = FTL::canCompile(m_graph);

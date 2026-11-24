@@ -37,6 +37,7 @@
 #include "Options.h"
 #include "ThunkGenerators.h"
 #include "TypeProfilerLog.h"
+#include "TierUpOverride.h"
 #include <wtf/NeverDestroyed.h>
 
 namespace JSC { namespace DFG {
@@ -59,11 +60,15 @@ static CompilationResult compileImpl(
     case JITCompilationMode::UnlinkedDFG:
         if (!Options::bytecodeRangeToDFGCompile().isInRange(codeBlock->instructionsSize()) || !ensureGlobalDFGAllowlist().contains(codeBlock))
             return CompilationResult::CompilationFailed;
+        if (TierUpOverride::isEnabled() && !TierUpOverride::allowsCompile(codeBlock, TierUpOverride::Step::DFG)) [[unlikely]]
+            return CompilationResult::CompilationFailed;
         break;
     case JITCompilationMode::FTL:
     case JITCompilationMode::FTLForOSREntry:
 #if ENABLE(FTL_JIT)
         if (!Options::bytecodeRangeToFTLCompile().isInRange(codeBlock->instructionsSize()) || !ensureGlobalFTLAllowlist().contains(codeBlock))
+            return CompilationResult::CompilationFailed;
+        if (TierUpOverride::isEnabled() && !TierUpOverride::allowsCompile(codeBlock, TierUpOverride::Step::FTL)) [[unlikely]]
             return CompilationResult::CompilationFailed;
         break;
 #else

@@ -31,6 +31,7 @@
 #include "CodeBlock.h"
 #include "FTLForOSREntryJITCode.h"
 #include "JumpTable.h"
+#include "TierUpOverride.h"
 
 namespace JSC { namespace DFG {
 
@@ -350,6 +351,8 @@ void JITCode::optimizeAfterWarmUp(CodeBlock* codeBlock)
         threshold = static_cast<int32_t>(threshold * Options::quickFTLTierUpThresholdFactor());
         dataLogLnIf(Options::verboseOSR(), *codeBlock, ": Quick FTL tier-up enabled and code is stable, adjustedThreshold=", threshold, ", finalThreshold=", baseline->adjustedCounterValue(threshold));
     }
+    if (TierUpOverride::isEnabled()) [[unlikely]]
+        threshold = TierUpOverride::adjustThreshold(baseline, TierUpOverride::Step::FTL, threshold);
     codeBlock->dfgJITData()->tierUpCounter().setNewThreshold(baseline->adjustedCounterValue(threshold), baseline);
 }
 
@@ -358,7 +361,10 @@ void JITCode::optimizeSoon(CodeBlock* codeBlock)
     ASSERT(codeBlock->jitType() == JITType::DFGJIT);
     dataLogLnIf(Options::verboseOSR(), *codeBlock, ": FTL-optimizing soon.");
     CodeBlock* baseline = codeBlock->baselineVersion();
-    codeBlock->dfgJITData()->tierUpCounter().setNewThreshold(baseline->adjustedCounterValue(Options::thresholdForFTLOptimizeSoon()), codeBlock);
+    int32_t threshold = Options::thresholdForFTLOptimizeSoon();
+    if (TierUpOverride::isEnabled()) [[unlikely]]
+        threshold = TierUpOverride::adjustThreshold(baseline, TierUpOverride::Step::FTL, threshold);
+    codeBlock->dfgJITData()->tierUpCounter().setNewThreshold(baseline->adjustedCounterValue(threshold), codeBlock);
 }
 
 void JITCode::forceOptimizationSlowPathConcurrently(CodeBlock* codeBlock)
