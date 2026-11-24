@@ -191,10 +191,21 @@ HashMap<CodeBlock*, std::unique_ptr<FnState>>* s_fn;
 HashMap<CodeBlock*, std::unique_ptr<OptState>>* s_opt;
 Stats s_stats;
 Vector<Record>* s_retired;
-// mixer: weights per bucket (function class 0..3, step 0..1) per tier-up expert
-double s_weight[4][2][NumTierExperts];
+// mixer: log-weights (sum of -lambda * loss / unit) per tier-up expert, at three levels:
+// global, function class (0..3), and bucket (class, step). The bucket level alone is the D5
+// mixer; --tierUpMixerPool=hierarchy decides on the sum of all three (D12).
+double s_logGlobal[NumTierExperts] { };
+double s_logClass[4][NumTierExperts] { };
+double s_logBucket[4][2][NumTierExperts] { };
+bool s_poolHierarchy { false };
+bool s_weightedMajority { false };
 uint64_t s_mixerChose[NumTierExperts] { };
-uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 };
+uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 }, s_majorityOverrodeJsc { 0 };
+// queue-wait measurement per compile tier: plans, plans that arrived behind >= 1 / >= 2 plans,
+// total wait ms, waits >= 1 ms, max wait ms
+struct QueueStats { uint64_t plans { 0 }, behind1 { 0 }, behind2 { 0 }, waits1ms { 0 }; double waitMs { 0 }, maxWaitMs { 0 }; };
+QueueStats s_queue[3];
+Lock s_queueLock;
 // online speedup aggregates (per class 0..3 + global 4, per pair): ms lo, work lo, ms hi, work hi
 double s_onlineAgg[5][3][4] { };
 MonotonicTime s_lastAggRefresh;
@@ -423,15 +434,11 @@ void chargeWeight(FnState& st, unsigned step, unsigned e, double ms) WTF_REQUIRE
 {
     if (!mixerOn() || !(s_mix & (1 << e)) || !(ms > 0))
         return;
-    double* w = s_weight[std::max<int8_t>(st.functionClass, 0)][step];
-    w[e] *= std::exp(-kLearningRate * ms / intervalMs());
-    double max = 0;
-    for (unsigned i = 0; i < NumTierExperts; ++i)
-        max = std::max(max, w[i]);
-    if (max > 0 && max < 1e-100) { // renormalise long before underflow
-        for (unsigned i = 0; i < NumTierExperts; ++i)
-            w[i] /= max;
-    }
+    unsigned c = std::max<int8_t>(st.functionClass, 0);
+    double delta = -kLearningRate * ms / intervalMs();
+    s_logBucket[c][step][e] += delta;
+    s_logClass[c][e] += delta;
+    s_logGlobal[e] += delta;
     s_weightUpdates++;
 }
 
@@ -699,17 +706,27 @@ void dump()
     Locker locker { s_lock };
     dataLogLn("tierUpExperts: selected tierUp=", kTierNames[s_tierSelected], " deopt=", kDeoptNames[s_deoptSelected],
         " mix=", static_cast<unsigned>(s_mix), " pulls=", s_stats.pulls, " quietGaps=", s_stats.quietGaps);
+    {
+        Locker queueLocker { s_queueLock };
+        const char* tiers[] = { "Baseline", "DFG", "FTL" };
+        for (unsigned t = 0; t < 3; ++t) {
+            const QueueStats& q = s_queue[t];
+            dataLogLn("tierUpExperts: queue tier=", tiers[t], " plans=", q.plans, " arrivedBehind>=1=", q.behind1, " >=2=", q.behind2,
+                " waits>=1ms=", q.waits1ms, " totalWaitMs=", q.waitMs, " maxWaitMs=", q.maxWaitMs);
+        }
+    }
     if (mixerOn()) {
-        dataLog("tierUpExperts: mixer weightUpdates=", s_weightUpdates, " unpricedUpdates=", s_unpricedUpdates, " chose");
+        dataLog("tierUpExperts: mixer rule=", s_weightedMajority ? "weighted-majority" : "argmax", " pool=", s_poolHierarchy ? "hierarchy" : "bucket",
+            " weightUpdates=", s_weightUpdates, " unpricedUpdates=", s_unpricedUpdates, " majorityOverrodeJsc=", s_majorityOverrodeJsc, " chose");
         for (unsigned e = 0; e < NumTierExperts; ++e)
             dataLog(" ", kTierNames[e], "=", s_mixerChose[e]);
         dataLogLn();
         for (unsigned c = 0; c < 4; ++c) {
             for (unsigned st = 0; st < 2; ++st) {
-                dataLog("tierUpExperts: mixer weights class=", c, " step=", st);
+                dataLog("tierUpExperts: mixer logWeights class=", c, " step=", st);
                 for (unsigned e = 0; e < NumTierExperts; ++e) {
                     if (s_mix & (1 << e))
-                        dataLog(" ", kTierNames[e], "=", s_weight[c][st][e]);
+                        dataLog(" ", kTierNames[e], "=", s_logBucket[c][st][e]);
                 }
                 dataLogLn();
             }
@@ -903,12 +920,13 @@ void initialize(VM& vm)
         }
     }
     RELEASE_ASSERT_WITH_MESSAGE(s_tierSelected == TMixer || (s_mix & (1 << s_tierSelected)), "tierUpExperts: the acting expert must be in --tierUpMixExperts");
-    for (auto& c : s_weight) {
-        for (auto& b : c) {
-            for (double& w : b)
-                w = 1;
-        }
-    }
+    auto option = [](const char8_t* o) { return o ? String::fromUTF8(reinterpret_cast<const char*>(o)) : String(); };
+    String pool = option(Options::tierUpMixerPool());
+    String rule = option(Options::tierUpMixerRule());
+    RELEASE_ASSERT_WITH_MESSAGE(pool.isNull() || pool == "bucket"_s || pool == "hierarchy"_s, "tierUpExperts: --tierUpMixerPool=bucket|hierarchy");
+    RELEASE_ASSERT_WITH_MESSAGE(rule.isNull() || rule == "argmax"_s || rule == "weighted-majority"_s, "tierUpExperts: --tierUpMixerRule=argmax|weighted-majority");
+    s_poolHierarchy = pool == "hierarchy"_s;
+    s_weightedMajority = rule == "weighted-majority"_s;
     g_deoptEnabled = !!d;
     found = !d;
     for (unsigned e = 0; d && e < NumDeoptExperts; ++e) {
@@ -960,7 +978,11 @@ void forget(CodeBlock* codeBlock)
             if (FnState* i = findFnState(inliner))
                 i->inlinees.removeAll(codeBlock);
         }
-        s_retired->append(makeRecord(codeBlock, st)); // keep its scoring data for the end-of-run pricing
+        // Keep its scoring data for the end-of-run pricing, if it has any.
+        bool hasData = st.haveLatest[0] || st.haveLatest[1] || st.pendingEarly[0] || st.pendingEarly[1]
+            || !st.raw.early.isEmpty() || st.sampleMs[0] > 0 || st.sampleMs[1] > 0 || st.sampleMs[2] > 0;
+        if (hasData)
+            s_retired->append(makeRecord(codeBlock, st));
         s_waiters->remove(codeBlock);
         s_fn->remove(it);
     }
@@ -1066,8 +1088,10 @@ void reevaluateWaiters()
 template<typename ScoringFingerprintOf>
 void scoreDecision(CodeBlock* baseline, unsigned si, const Vote* v, Vote acted, std::optional<uint64_t> ownFingerprint, const ScoringFingerprintOf& scoringFingerprintOf)
 {
+    // --tierUpGhostNoSynthetic: no synthetic losses, so no ghost snapshots and no fingerprint.
+    bool synthetic = !Options::tierUpGhostNoSynthetic();
     bool needFingerprint = false;
-    {
+    if (synthetic) {
         Locker locker { s_lock };
         FnState& st = fnState(baseline);
         for (unsigned e = 0; e < NumTierExperts; ++e)
@@ -1135,7 +1159,7 @@ void scoreDecision(CodeBlock* baseline, unsigned si, const Vote* v, Vote acted, 
             s_waiters->add(baseline);
         return;
     }
-    for (unsigned e = 0; e < NumTierExperts; ++e) {
+    for (unsigned e = 0; e < NumTierExperts && synthetic; ++e) {
         if (v[e] == Yes && !st.ghostActive[si][e]) {
             st.ghostActive[si][e] = true;
             st.ghostFingerprint[si][e] = scoringFp;
@@ -1273,16 +1297,42 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         for (unsigned e = 0; e < NumTierExperts; ++e)
             s_stats.tierVotes[e][dpi][v[e]]++;
         if (mixerOn()) {
-            // The awake expert in the mix with the largest weight in this decision's bucket acts
-            // (ties: jsc-default, then lower index).
-            const double* w = s_weight[classOf(baseline, st)][ftl ? 1 : 0];
-            unsigned chosen = TJsc;
-            for (unsigned e = 1; e < NumTierExperts; ++e) {
-                if (inMix[e] && v[e] != Abstain && w[e] > w[chosen])
-                    chosen = e;
+            unsigned c = classOf(baseline, st);
+            unsigned si = ftl ? 1 : 0;
+            auto score = [&](unsigned e) {
+                double l = s_logBucket[c][si][e];
+                if (s_poolHierarchy)
+                    l += s_logClass[c][e] + s_logGlobal[e];
+                return l;
+            };
+            if (!s_weightedMajority) {
+                // D5: the awake expert in the mix with the largest weight acts (ties: jsc-default,
+                // then lower index).
+                unsigned chosen = TJsc;
+                for (unsigned e = 1; e < NumTierExperts; ++e) {
+                    if (inMix[e] && v[e] != Abstain && score(e) > score(chosen))
+                        chosen = e;
+                }
+                s_mixerChose[chosen]++;
+                acted = v[chosen];
+            } else {
+                // D12: weighted majority (Littlestone-Warmuth) of the awake experts' votes; an exact
+                // tie keeps jsc-default's vote.
+                double top = score(TJsc);
+                for (unsigned e = 1; e < NumTierExperts; ++e) {
+                    if (inMix[e] && v[e] != Abstain)
+                        top = std::max(top, score(e));
+                }
+                double go = 0, wait = 0;
+                for (unsigned e = 0; e < NumTierExperts; ++e) {
+                    if (!inMix[e] || v[e] == Abstain)
+                        continue;
+                    (v[e] == Yes ? go : wait) += std::exp(score(e) - top);
+                }
+                acted = go > wait ? Yes : wait > go ? No : v[TJsc];
+                if (acted != v[TJsc])
+                    s_majorityOverrodeJsc++;
             }
-            s_mixerChose[chosen]++;
-            acted = v[chosen];
         } else
             acted = v[s_tierSelected] == Abstain ? v[TJsc] : v[s_tierSelected];
 
@@ -1444,6 +1494,8 @@ bool loopReoptimize(CodeBlock* optimized, bool jscJettison)
 // ---------------------------------------------------------------- observations
 void noteIncomingCall(CodeBlock* callee, JSCell* caller)
 {
+    if (!(s_mix & (1 << TSupply)))
+        return; // call edges feed only Supply
     CodeBlock* callerCodeBlock = dynamicDowncast<CodeBlock>(caller);
     if (!callerCodeBlock || callerCodeBlock == callee)
         return;
@@ -1606,6 +1658,27 @@ void noteSample(CodeBlock* root, unsigned tier)
                 st->raw.delayedJsc[si][h][e] += ms;
         }
     }
+}
+
+void noteQueueWait(unsigned tier, double waitMs, unsigned ahead, size_t)
+{
+    if (tier >= 3)
+        return;
+    Locker locker { s_queueLock };
+    QueueStats& q = s_queue[tier];
+    q.plans++;
+    q.behind1 += ahead >= 1;
+    q.behind2 += ahead >= 2;
+    q.waits1ms += waitMs >= 1;
+    q.waitMs += waitMs;
+    q.maxWaitMs = std::max(q.maxWaitMs, waitMs);
+}
+
+bool isWorkCounted(CodeBlock* codeBlock)
+{
+    ScriptExecutable* executable = codeBlock->ownerExecutable();
+    unsigned position = (static_cast<unsigned>(executable->firstLine()) << 12) ^ static_cast<unsigned>(executable->startColumn());
+    return !(WTF::intHash(position) % std::max(1u, Options::tierUpExpertsWorkCountedOneIn()));
 }
 
 uint64_t* workCounterFor(CodeBlock* machine, bool ftl)

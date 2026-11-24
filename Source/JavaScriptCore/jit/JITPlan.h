@@ -136,6 +136,10 @@ protected:
     JITPlanStage m_stage { JITPlanStage::Preparing };
     JITCompilationMode m_mode;
     MonotonicTime m_timeBeforeFTL;
+public:
+    MonotonicTime m_minutemanEnqueued; // minuteman: queue-wait measurement (TierUpExperts)
+    unsigned m_minutemanAhead { 0 };   // plans already queued in its tier when it was enqueued
+protected:
     VM* m_vm;
     CodeBlock* m_codeBlock;
     CheckedPtr<JITWorkerSlot> m_workerSlot;

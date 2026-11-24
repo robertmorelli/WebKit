@@ -96,6 +96,12 @@ void initialize(VM&);
 void shutdown(VM&);
 inline bool enabled() { return g_enabled; }
 inline bool deoptEnabled() { return g_deoptEnabled; }
+// The uniform work counter (calls + loop back-edges in Baseline/DFG/FTL code) that prices
+// losses with in-run tier speedups. --tierUpExpertsNoWorkCounters turns it off (overhead
+// measurement only; losses then fall back to unpriced).
+inline bool workCounting() { return g_enabled && !Options::tierUpExpertsNoWorkCounters(); }
+// Loop back-edges too (--tierUpExpertsWorkCountersCallsOnly: calls only; overhead measurement).
+inline bool workCountingLoops() { return workCounting() && !Options::tierUpExpertsWorkCountersCallsOnly(); }
 
 // ---- tier-up decision points. `jscGo` is JSC's own decision at this point, computed by the
 // caller with JSC's code. Returns whether to compile now. If the acted decision is to wait while
@@ -127,6 +133,15 @@ void noteJettison(CodeBlock* optimized, Profiler::JettisonReason); // after JSC 
 enum class ProfileKind : uint8_t { Bytecode, Argument, Lazy };
 void noteConsumedPrediction(CodeBlock* machine, CodeBlock* profiled, ProfileKind, BytecodeIndex, uint64_t operandBits, SpeculatedType);
 void forget(CodeBlock*);
+// The work counter is emitted only for a fixed 1 in kWorkCountedOneIn of functions, chosen by
+// source position (D14): the measured cost of counting everything (~2% steady on TUNE) is cut
+// by that factor; other functions are priced with their class's or the run's speedup.
+// --tierUpExpertsWorkCountedOneIn (default 8; 1 = every function).
+bool isWorkCounted(CodeBlock*);
+// Queue-wait measurement (D17): a plan of compile tier `tier` (0 Baseline, 1 DFG, 2 FTL) left the
+// queue after `waitMs`; `ahead` plans were queued or compiling in its tier when it arrived, and
+// `stillQueued` remain queued behind it.
+void noteQueueWait(unsigned tier, double waitMs, unsigned ahead, size_t stillQueued);
 // Work counter (calls + loop back-edges) for optimized code being compiled (compiler thread).
 uint64_t* workCounterFor(CodeBlock* machine, bool ftl);
 // From the time-attribution sampler thread: one sample charged to (`root`, tier), with tier as

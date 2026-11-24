@@ -23086,7 +23086,7 @@ IGNORE_CLANG_WARNINGS_END
 
     void compileLoopHint()
     {
-        if (m_minutemanWork) [[unlikely]]
+        if (m_minutemanWork && TierUpExperts::workCountingLoops()) [[unlikely]]
             m_out.store64(m_out.add(m_out.load64(m_out.absolute(m_minutemanWork)), m_out.constInt64(1)), m_out.absolute(m_minutemanWork));
         if (!Options::returnEarlyFromInfiniteLoopsForFuzzing()) [[likely]]
             return;
@@ -28516,7 +28516,7 @@ IGNORE_CLANG_WARNINGS_END
     Graph& m_graph;
     // minuteman (tools/TierUpExperts): this compile's work counter (calls + loop back-edges),
     // when the ghost machinery is on.
-    uint64_t* m_minutemanWork { TierUpExperts::enabled() ? TierUpExperts::workCounterFor(m_graph.m_codeBlock, true) : nullptr };
+    uint64_t* m_minutemanWork { TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock) ? TierUpExperts::workCounterFor(m_graph.m_codeBlock, true) : nullptr };
     State& m_ftlState;
     Procedure& m_proc;
     AbstractHeapRepository& m_heaps;

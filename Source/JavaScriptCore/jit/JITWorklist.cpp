@@ -26,6 +26,8 @@
 #include "config.h"
 #include "JITWorklist.h"
 
+#include "TierUpExperts.h"
+
 #if ENABLE(JIT)
 
 #include "CodeBlock.h"
@@ -244,6 +246,10 @@ CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
     ASSERT(m_plans.find(plan->key()) == m_plans.end());
     m_plans.add(plan->key(), plan.copyRef());
     m_totalLoad += planLoad(plan);
+    if (TierUpExperts::enabled()) [[unlikely]] {
+        plan->m_minutemanEnqueued = MonotonicTime::now();
+        plan->m_minutemanAhead = m_queues[tier].size() + m_ongoingCompilationsPerTier[tier];
+    }
     m_queues[tier].append(WTF::move(plan));
     wakeThreads(locker, tier);
     return CompilationResult::CompilationDeferred;
@@ -282,6 +288,8 @@ bool JITWorklist::dequeuePlan(const AbstractLocker&, JITWorkerSlot& slot)
 
         slot.m_plan = m_queues[i].takeFirst();
         RELEASE_ASSERT(slot.m_plan);
+        if (TierUpExperts::enabled()) [[unlikely]]
+            TierUpExperts::noteQueueWait(i, (MonotonicTime::now() - slot.m_plan->m_minutemanEnqueued).milliseconds(), slot.m_plan->m_minutemanAhead, m_queues[i].size());
         RELEASE_ASSERT(slot.m_plan->stage() == JITPlanStage::Preparing);
         // Dequeuing this plan doesn't change the total load yet, but it will once the compilation finishes.
         // If the plan is canceled during compilation, the codeBlock may no longer be alive, so remember the plan's load now.
