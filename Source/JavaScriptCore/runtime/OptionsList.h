@@ -166,6 +166,7 @@ bool hasCapacityToUseLargeGigacage();
     v(Bool, tierUpTimeAttributionSelfSampling, false, Normal, "minuteman: sample with a per-thread CPU-time SIGPROF timer delivered to the JS thread (lock-free ring, no suspend/resume) instead of suspending it; Linux x86_64 only"_s) \
     v(Bool, verboseTierUpTimeAttribution, false, Normal, "minuteman: print time attribution summary at exit"_s) \
     v(OptionString, tierUpExpert, nullptr, Normal, "minuteman: DFG/FTL tier-up expert: jsc-default, cost-benefit, stability-gate, caller-triggered, inline-aware, mixer (see tools/TierUpExperts.h). Off by default."_s) \
+    v(OptionString, tierUpMixExperts, nullptr, Normal, "minuteman: comma-separated tier-up experts that compute votes (lean build); unset = all"_s) \
     v(OptionString, deoptExpert, nullptr, Normal, "minuteman: jettison expert: jsc-default, rate-based, quarantine, mixer (see tools/TierUpExperts.h). Off by default."_s) \
     v(Bool, verboseTierUpExperts, false, Normal, "minuteman: print tier-up/deopt expert statistics at exit"_s) \
     v(OptionString, profileConsumptionLogFile, nullptr, Normal, "minuteman diagnostic: per optimizing compile, the tier and IC/LLInt status source of every inlinee site the parser read (see tools/ProfileConsumptionLog.h). Off by default."_s) \

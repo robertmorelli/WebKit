@@ -47,6 +47,7 @@ struct MinutemanValueProfileAccess {
 namespace TierUpExperts {
 
 bool g_enabled { false };
+bool g_deoptEnabled { false };
 
 namespace {
 
@@ -58,11 +59,14 @@ enum TierExpert : unsigned { TJsc, TSupply, TQuiescence, TSampleGravity, TQueueS
 enum DeoptExpert : unsigned { DJsc, DRefutation, DCauseSplit, NumDeoptExperts };
 enum Vote : uint8_t { Abstain = 0, Yes = 1, No = 2 }; // Yes = Go / Jettison, No = Wait / Keep
 
-const char* const kTierNames[] = { "jsc-default", "supply", "quiescence", "sample-gravity", "queue-slack" };
+const char* const kTierNames[] = { "jsc-default", "supply", "quiescence", "sample-gravity", "queue-slack", "mixer" };
 const char* const kDeoptNames[] = { "jsc-default", "refutation", "cause-split" };
 const char* const kDPNames[] = { "LLIntToBaseline", "BaselineToDFG", "BaselineLoopOSR", "DFGToFTL", "DFGLoopOSR", "Retier", "Exit", "LoopReoptimize" };
 
 unsigned s_tierSelected { TJsc };
+constexpr unsigned TMixer = NumTierExperts; // s_tierSelected value for the mixer
+uint8_t s_mix { 0xff };  // tier-up experts that compute votes (lean build: only the mix's)
+constexpr double kLearningRate = 0.45; // LeCaR's learning rate
 unsigned s_deoptSelected { DJsc };
 
 // ---------------------------------------------------------------- state
@@ -101,6 +105,17 @@ struct FnState { // per baseline CodeBlock
     bool requireChange { false };
     // queue-slack
     uint64_t lastJettisonTickPlusOne { 0 };
+    MonotonicTime lastJettison; // lean Queue-Slack: recent-jettison window by timestamp
+    // mixer: online jettison cost for synthetic pricing (sum, count) per step
+    double onlineEarly[2][2] { };
+    // mixer: losses not yet priceable (no speedup yet), applied when it is: raw ms per pair
+    // ((B,D), (B,F), (D,F)) per expert, for (1 - 1/s) losses and (s - 1) losses; unpriced
+    // synthetic votes per step per expert. Multiplicative updates commute, so deferral loses
+    // only timeliness.
+    double pendingFaster[2][3][5] { }; // [step][pair][expert]
+    double pendingSlower[2][3][5] { };
+    unsigned pendingSynthetic[2][5] { };
+    bool hasPending { false };
     // ---- ghost scoring. Step si: 0 = Baseline->DFG, 1 = DFG->FTL. Tier index t: 0 Baseline, 1 DFG, 2 FTL.
     Vote latest[2][5] { };          // each tier-up expert's vote at the most recent decision point
     uint8_t latestAwake[2] { 0, 0 }; // experts awake (not abstaining) at that point
@@ -176,6 +191,15 @@ HashMap<CodeBlock*, std::unique_ptr<FnState>>* s_fn;
 HashMap<CodeBlock*, std::unique_ptr<OptState>>* s_opt;
 Stats s_stats;
 Vector<Record>* s_retired;
+// mixer: weights per bucket (function class 0..3, step 0..1) per tier-up expert
+double s_weight[4][2][NumTierExperts];
+uint64_t s_mixerChose[NumTierExperts] { };
+uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 };
+// online speedup aggregates (per class 0..3 + global 4, per pair): ms lo, work lo, ms hi, work hi
+double s_onlineAgg[5][3][4] { };
+MonotonicTime s_lastAggRefresh;
+// online jettison costs for synthetic pricing, per class (0..3) and step
+double s_onlineClassEarly[4][2][2] { }; // sum, count
 HashSet<CodeBlock*>* s_waiters; // functions with pending waiters (waiting[] != 0)
 MonotonicTime s_lastReevaluation;
 uint64_t s_pointId { 0 };
@@ -242,10 +266,50 @@ int8_t classOf(CodeBlock* baseline, FnState& st)
     return c;
 }
 
-void closePendingEarly(FnState& st, unsigned step) WTF_REQUIRES_LOCK(s_lock)
+std::optional<double> onlineSpeedup(CodeBlock*, FnState&, unsigned) WTF_REQUIRES_LOCK(s_lock);
+void chargeFaster(CodeBlock*, FnState&, unsigned step, unsigned e, unsigned p, double ms) WTF_REQUIRES_LOCK(s_lock);
+void chargeWeight(FnState&, unsigned step, unsigned e, double ms) WTF_REQUIRES_LOCK(s_lock);
+bool mixerOn();
+
+void closePendingEarly(FnState& st, unsigned step, CodeBlock* baseline = nullptr) WTF_REQUIRES_LOCK(s_lock)
 {
     if (!st.pendingEarly[step])
         return;
+    if (baseline && mixerOn()) {
+        // Online price for the mixer, the same formula as the end-of-run pricing; parts whose
+        // speedup is not known yet are deferred. The cost is also recorded (when fully priced)
+        // to price synthetic votes.
+        double cost = 0;
+        bool priced = true;
+        struct Part { double ms; unsigned pair; };
+        Vector<Part, 2> parts;
+        if (!step)
+            parts.append({ st.pendingLowerMs[0][0], 0 });
+        else {
+            parts.append({ st.pendingLowerMs[1][0], 1 });
+            parts.append({ st.pendingLowerMs[1][1], 2 });
+        }
+        for (auto& part : parts) {
+            if (!(part.ms > 0))
+                continue;
+            auto sp = onlineSpeedup(baseline, st, part.pair);
+            if (sp)
+                cost += part.ms * (1 - 1 / *sp);
+            else
+                priced = false;
+            for (unsigned e = 0; e < NumTierExperts; ++e) {
+                if ((st.pendingYes[step] & (1 << e)) && (s_mix & (1 << e)))
+                    chargeFaster(baseline, st, step, e, part.pair, part.ms);
+            }
+        }
+        if (priced) {
+            st.onlineEarly[step][0] += cost;
+            st.onlineEarly[step][1]++;
+            unsigned c = std::max<int8_t>(st.functionClass, 0);
+            s_onlineClassEarly[c][step][0] += cost;
+            s_onlineClassEarly[c][step][1]++;
+        }
+    }
     st.raw.early.append({ static_cast<uint8_t>(step), st.pendingYes[step], st.pendingAwake[step],
         { st.pendingLowerMs[step][0], st.pendingLowerMs[step][1] } });
     st.pendingEarly[step] = false;
@@ -312,6 +376,140 @@ Record makeRecord(CodeBlock* baseline, FnState& st) WTF_REQUIRES_LOCK(s_lock)
     return r;
 }
 
+// ---------------------------------------------------------------- mixer: online pricing
+bool mixerOn() { return s_tierSelected == TMixer; }
+
+// Online speedup for pair p ((B,D), (B,F), (D,F)): the function's own in-run data, else its
+// class's aggregate, else the run's global aggregate (aggregates refreshed every 100 ms).
+std::optional<double> onlineSpeedup(CodeBlock* baseline, FnState& st, unsigned p) WTF_REQUIRES_LOCK(s_lock)
+{
+    constexpr unsigned pairs[3][2] = { { 0, 1 }, { 0, 2 }, { 1, 2 } };
+    unsigned lo = pairs[p][0], hi = pairs[p][1];
+    uint64_t wlo = workOf(baseline, st, lo), whi = workOf(baseline, st, hi);
+    if (st.sampleMs[lo] > 0 && wlo && st.sampleMs[hi] > 0 && whi)
+        return (st.sampleMs[lo] / wlo) / (st.sampleMs[hi] / whi);
+    for (unsigned c : { static_cast<unsigned>(std::max<int8_t>(st.functionClass, 0)), 4u }) {
+        const double* a = s_onlineAgg[c][p];
+        if (a[0] > 0 && a[1] > 0 && a[2] > 0 && a[3] > 0)
+            return (a[0] / a[1]) / (a[2] / a[3]);
+    }
+    return std::nullopt;
+}
+
+void refreshOnlineAggregates() WTF_REQUIRES_LOCK(s_lock)
+{
+    constexpr unsigned pairs[3][2] = { { 0, 1 }, { 0, 2 }, { 1, 2 } };
+    double agg[5][3][4] { };
+    for (auto& [function, st] : *s_fn) {
+        uint64_t w[3] = { workOf(function, *st, 0), workOf(function, *st, 1), workOf(function, *st, 2) };
+        for (unsigned p = 0; p < 3; ++p) {
+            unsigned lo = pairs[p][0], hi = pairs[p][1];
+            if (!(st->sampleMs[lo] > 0 && w[lo] && st->sampleMs[hi] > 0 && w[hi]))
+                continue;
+            for (unsigned c : { static_cast<unsigned>(std::max<int8_t>(st->functionClass, 0)), 4u }) {
+                agg[c][p][0] += st->sampleMs[lo];
+                agg[c][p][1] += w[lo];
+                agg[c][p][2] += st->sampleMs[hi];
+                agg[c][p][3] += w[hi];
+            }
+        }
+    }
+    memcpy(s_onlineAgg, agg, sizeof(agg));
+}
+
+// Multiplicative-weights update of expert e in the function's (class, step) bucket for a loss of
+// `ms` extra time; one unit = one sampling interval (the analogue of one cache miss).
+void chargeWeight(FnState& st, unsigned step, unsigned e, double ms) WTF_REQUIRES_LOCK(s_lock)
+{
+    if (!mixerOn() || !(s_mix & (1 << e)) || !(ms > 0))
+        return;
+    double* w = s_weight[std::max<int8_t>(st.functionClass, 0)][step];
+    w[e] *= std::exp(-kLearningRate * ms / intervalMs());
+    double max = 0;
+    for (unsigned i = 0; i < NumTierExperts; ++i)
+        max = std::max(max, w[i]);
+    if (max > 0 && max < 1e-100) { // renormalise long before underflow
+        for (unsigned i = 0; i < NumTierExperts; ++i)
+            w[i] /= max;
+    }
+    s_weightUpdates++;
+}
+
+// Charge a loss of `ms` lower-tier time that pair p's higher tier would have run faster:
+// ms x (1 - 1/s). Deferred if the speedup is not known yet.
+void chargeFaster(CodeBlock* baseline, FnState& st, unsigned step, unsigned e, unsigned p, double ms) WTF_REQUIRES_LOCK(s_lock)
+{
+    if (auto sp = onlineSpeedup(baseline, st, p))
+        chargeWeight(st, step, e, ms * (1 - 1 / *sp));
+    else {
+        st.pendingFaster[step][p][e] += ms;
+        st.hasPending = true;
+        s_unpricedUpdates++;
+    }
+}
+
+// Charge `ms` of higher-tier time that the lower tier would have taken longer: ms x (s - 1).
+void chargeSlower(CodeBlock* baseline, FnState& st, unsigned step, unsigned e, unsigned p, double ms) WTF_REQUIRES_LOCK(s_lock)
+{
+    if (auto sp = onlineSpeedup(baseline, st, p))
+        chargeWeight(st, step, e, ms * (*sp - 1));
+    else {
+        st.pendingSlower[step][p][e] += ms;
+        st.hasPending = true;
+        s_unpricedUpdates++;
+    }
+}
+
+std::optional<double> onlineEarlyMean(FnState& st, unsigned step) WTF_REQUIRES_LOCK(s_lock)
+{
+    if (st.onlineEarly[step][1])
+        return st.onlineEarly[step][0] / st.onlineEarly[step][1];
+    unsigned c = std::max<int8_t>(st.functionClass, 0);
+    if (s_onlineClassEarly[c][step][1])
+        return s_onlineClassEarly[c][step][0] / s_onlineClassEarly[c][step][1];
+    return std::nullopt;
+}
+
+// Apply deferred losses whose speedup / jettison cost is now known (every aggregate refresh).
+void applyPending() WTF_REQUIRES_LOCK(s_lock)
+{
+    for (auto& [function, st] : *s_fn) {
+        if (!st->hasPending)
+            continue;
+        bool left = false;
+        for (unsigned p = 0; p < 3; ++p) {
+            auto sp = onlineSpeedup(function, *st, p);
+            for (unsigned step = 0; step < 2; ++step) {
+                for (unsigned e = 0; e < NumTierExperts; ++e) {
+                    if (!st->pendingFaster[step][p][e] && !st->pendingSlower[step][p][e])
+                        continue;
+                    if (!sp) {
+                        left = true;
+                        continue;
+                    }
+                    chargeWeight(*st, step, e, st->pendingFaster[step][p][e] * (1 - 1 / *sp));
+                    chargeWeight(*st, step, e, st->pendingSlower[step][p][e] * (*sp - 1));
+                    st->pendingFaster[step][p][e] = st->pendingSlower[step][p][e] = 0;
+                }
+            }
+        }
+        for (unsigned step = 0; step < 2; ++step) {
+            auto mean = onlineEarlyMean(*st, step);
+            for (unsigned e = 0; e < NumTierExperts; ++e) {
+                if (!st->pendingSynthetic[step][e])
+                    continue;
+                if (!mean) {
+                    left = true;
+                    continue;
+                }
+                chargeWeight(*st, step, e, st->pendingSynthetic[step][e] * *mean);
+                st->pendingSynthetic[step][e] = 0;
+            }
+        }
+        st->hasPending = left;
+    }
+}
+
 bool isDeoptDP(unsigned dp)
 {
     return dp == static_cast<unsigned>(DP::Exit) || dp == static_cast<unsigned>(DP::LoopReoptimize) || dp == static_cast<unsigned>(DP::Retier);
@@ -337,30 +535,37 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
 
     // pairs: (B,D) (B,F) (D,F)
     constexpr unsigned pairs[3][2] = { { 0, 1 }, { 0, 2 }, { 1, 2 } };
-    double classMs[5][3][2] { }, classWork[5][3][2] { };
+    double classMs[6][3][2] { }, classWork[6][3][2] { }; // index 5: all functions (global level)
     auto cls = [](const Record& r) { return r.functionClass < 0 ? 4u : static_cast<unsigned>(r.functionClass); };
     for (auto& r : records) {
         for (unsigned p = 0; p < 3; ++p) {
             unsigned lo = pairs[p][0], hi = pairs[p][1];
             if (r.ms[lo] > 0 && r.work[lo] && r.ms[hi] > 0 && r.work[hi]) {
-                classMs[cls(r)][p][0] += r.ms[lo];
-                classWork[cls(r)][p][0] += r.work[lo];
-                classMs[cls(r)][p][1] += r.ms[hi];
-                classWork[cls(r)][p][1] += r.work[hi];
+                for (unsigned c : { cls(r), 5u }) {
+                    classMs[c][p][0] += r.ms[lo];
+                    classWork[c][p][0] += r.work[lo];
+                    classMs[c][p][1] += r.ms[hi];
+                    classWork[c][p][1] += r.work[hi];
+                }
             }
         }
     }
-    unsigned fromFunction = 0, fromClass = 0, missing = 0;
+    unsigned fromFunction = 0, fromClass = 0, fromGlobal = 0, missing = 0;
     auto speedup = [&](const Record& r, unsigned p) -> std::optional<double> {
         unsigned lo = pairs[p][0], hi = pairs[p][1];
         if (r.ms[lo] > 0 && r.work[lo] && r.ms[hi] > 0 && r.work[hi]) {
             fromFunction++;
             return (r.ms[lo] / r.work[lo]) / (r.ms[hi] / r.work[hi]);
         }
+        // Fallbacks, all from this run: the function's class, then every function.
         unsigned c = cls(r);
         if (classMs[c][p][0] > 0 && classMs[c][p][1] > 0) {
             fromClass++;
             return (classMs[c][p][0] / classWork[c][p][0]) / (classMs[c][p][1] / classWork[c][p][1]);
+        }
+        if (classMs[5][p][0] > 0 && classMs[5][p][1] > 0) {
+            fromGlobal++;
+            return (classMs[5][p][0] / classWork[5][p][0]) / (classMs[5][p][1] / classWork[5][p][1]);
         }
         missing++;
         return std::nullopt;
@@ -369,6 +574,7 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
     double late[NumTierExperts] { }, delayed[NumTierExperts] { }, early[NumTierExperts] { }, synthetic[NumTierExperts] { };
     double shadow[NumTierExperts] { };
     double unpricedMs = 0;
+    double unpricedByExpert[NumTierExperts] { };
     unsigned earlyEvents = 0, syntheticEvents = 0, syntheticUnpriced = 0;
     // Pass 1: price jettisons; per-record and per-class mean cost per step (for synthetic losses).
     Vector<std::array<std::pair<double, unsigned>, 2>> recordEarly(records.size());
@@ -426,13 +632,17 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
             if (sBD) {
                 late[e] += r.raw.late[0][e] * (1 - 1 / *sBD);
                 shadow[e] += r.raw.lateJsc[0][e] * (1 - 1 / *sBD);
-            } else
+            } else {
                 unpricedMs += r.raw.late[0][e];
+                unpricedByExpert[e] += r.raw.late[0][e];
+            }
             if (sDF) {
                 late[e] += r.raw.late[1][e] * (1 - 1 / *sDF);
                 shadow[e] += r.raw.lateJsc[1][e] * (1 - 1 / *sDF);
-            } else
+            } else {
                 unpricedMs += r.raw.late[1][e];
+                unpricedByExpert[e] += r.raw.late[1][e];
+            }
             // delayed: step 0 kept in Baseline instead of DFG (B->D) or FTL (B->F); step 1 kept in DFG instead of FTL
             std::optional<double> factor[2][2] = { { sBD, sBF }, { std::nullopt, sDF } };
             for (unsigned si = 0; si < 2; ++si) {
@@ -443,8 +653,10 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
                     if (factor[si][h]) {
                         delayed[e] += raw * (*factor[si][h] - 1);
                         shadow[e] += rawJsc * (*factor[si][h] - 1);
-                    } else
+                    } else {
                         unpricedMs += raw;
+                        unpricedByExpert[e] += raw;
+                    }
                 }
             }
             // synthetic: this function's mean priced jettison cost at that step, else its class's
@@ -469,12 +681,12 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
     }
     dataLog("tierUpExperts: ghostRegretMs interval=", intervalMs(), " functions=", records.size(),
         " earlyEvents=", earlyEvents, " syntheticEvents=", syntheticEvents, " syntheticUnpriced=", syntheticUnpriced,
-        " unpricedMs=", unpricedMs, " speedupFromFunction=", fromFunction, " fromClass=", fromClass, " missing=", missing,
+        " unpricedMs=", unpricedMs, " speedupFromFunction=", fromFunction, " fromClass=", fromClass, " fromGlobal=", fromGlobal, " missing=", missing,
         " reevaluations=", s_stats.reevaluations);
     for (unsigned e = 0; e < NumTierExperts; ++e) {
         double own = late[e] + delayed[e] + early[e] + synthetic[e];
         dataLog(" | ", kTierNames[e], " late/delayed/early/synthetic=", late[e], "/", delayed[e], "/", early[e], "/", synthetic[e],
-            " jscAtAwake=", shadow[e], " regret=", own - shadow[e]);
+            " jscAtAwake=", shadow[e], " regret=", own - shadow[e], " unpricedRawMs=", unpricedByExpert[e]);
     }
     dataLogLn();
 }
@@ -486,7 +698,23 @@ void dump()
     s_dumped = true;
     Locker locker { s_lock };
     dataLogLn("tierUpExperts: selected tierUp=", kTierNames[s_tierSelected], " deopt=", kDeoptNames[s_deoptSelected],
-        " pulls=", s_stats.pulls, " quietGaps=", s_stats.quietGaps);
+        " mix=", static_cast<unsigned>(s_mix), " pulls=", s_stats.pulls, " quietGaps=", s_stats.quietGaps);
+    if (mixerOn()) {
+        dataLog("tierUpExperts: mixer weightUpdates=", s_weightUpdates, " unpricedUpdates=", s_unpricedUpdates, " chose");
+        for (unsigned e = 0; e < NumTierExperts; ++e)
+            dataLog(" ", kTierNames[e], "=", s_mixerChose[e]);
+        dataLogLn();
+        for (unsigned c = 0; c < 4; ++c) {
+            for (unsigned st = 0; st < 2; ++st) {
+                dataLog("tierUpExperts: mixer weights class=", c, " step=", st);
+                for (unsigned e = 0; e < NumTierExperts; ++e) {
+                    if (s_mix & (1 << e))
+                        dataLog(" ", kTierNames[e], "=", s_weight[c][st][e]);
+                }
+                dataLogLn();
+            }
+        }
+    }
     priceAndReport();
     for (unsigned dp = 0; dp < kDPs; ++dp) {
         bool deopt = isDeoptDP(dp);
@@ -652,13 +880,36 @@ void initialize(VM& vm)
     s_gapLow = new std::priority_queue<double>();
     s_gapHigh = new std::priority_queue<double, std::vector<double>, std::greater<double>>();
     bool found = !t;
-    for (unsigned e = 0; t && e < NumTierExperts; ++e) {
+    for (unsigned e = 0; t && e <= TMixer; ++e) {
         if (is(t, kTierNames[e])) {
             s_tierSelected = e;
             found = true;
         }
     }
     RELEASE_ASSERT_WITH_MESSAGE(found, "tierUpExperts: unknown --tierUpExpert");
+    // Lean build: --tierUpMixExperts lists the experts that compute votes (jsc-default always
+    // does); unset = every expert (the full ghost machinery used for validation).
+    if (const char8_t* mix = Options::tierUpMixExperts()) {
+        s_mix = 1 << TJsc;
+        for (auto name : String::fromUTF8(reinterpret_cast<const char*>(mix)).split(',')) {
+            bool known = false;
+            for (unsigned e = 0; e < NumTierExperts; ++e) {
+                if (name == String::fromLatin1(kTierNames[e])) {
+                    s_mix |= 1 << e;
+                    known = true;
+                }
+            }
+            RELEASE_ASSERT_WITH_MESSAGE(known, "tierUpExperts: unknown expert in --tierUpMixExperts");
+        }
+    }
+    RELEASE_ASSERT_WITH_MESSAGE(s_tierSelected == TMixer || (s_mix & (1 << s_tierSelected)), "tierUpExperts: the acting expert must be in --tierUpMixExperts");
+    for (auto& c : s_weight) {
+        for (auto& b : c) {
+            for (double& w : b)
+                w = 1;
+        }
+    }
+    g_deoptEnabled = !!d;
     found = !d;
     for (unsigned e = 0; d && e < NumDeoptExperts; ++e) {
         if (is(d, kDeoptNames[e])) {
@@ -757,7 +1008,8 @@ Vote pureVote(unsigned e, unsigned si, CodeBlock* function, FnState& st, uint64_
     case TSampleGravity:
         return heavy && top != JITType::FTLJIT ? Yes : No;
     case TQueueSlack: {
-        bool recentJettison = st.lastJettisonTickPlusOne && tick + 1 - st.lastJettisonTickPlusOne <= 1;
+        UNUSED_PARAM(tick);
+        bool recentJettison = st.lastJettison && (now - st.lastJettison).milliseconds() < 20;
         if (idle > 0)
             return recentJettison ? Abstain : Yes;
         return s_haveEwma[si] && function->bytecodeCost() <= s_ewma[si] ? Yes : No;
@@ -774,6 +1026,11 @@ void reevaluateWaiters()
     Vector<CodeBlock*> functions;
     {
         Locker locker { s_lock };
+        if (mixerOn() && (now - s_lastAggRefresh).milliseconds() >= 100) {
+            s_lastAggRefresh = now;
+            refreshOnlineAggregates();
+            applyPending();
+        }
         if ((now - s_lastReevaluation).milliseconds() < 1 || s_waiters->isEmpty())
             return;
         s_lastReevaluation = now;
@@ -782,8 +1039,8 @@ void reevaluateWaiters()
     int64_t idle[2] = { idleCompilerSlots(false), idleCompilerSlots(true) };
     uint64_t tick = TierUpTimeAttribution::currentTick();
     for (CodeBlock* function : functions) {
-        uint64_t fingerprint = profileFingerprint(function);
-        bool heavy = TierUpTimeAttribution::inLowerTierHeavySet(function);
+        uint64_t fingerprint = (s_mix & (1 << TQuiescence)) ? profileFingerprint(function) : 0;
+        bool heavy = (s_mix & (1 << TSampleGravity)) && TierUpTimeAttribution::inLowerTierHeavySet(function);
         CodeBlock* replacement = function->replacement();
         JITType top = replacement ? replacement->jitType() : function->jitType();
         Locker locker { s_lock };
@@ -792,7 +1049,7 @@ void reevaluateWaiters()
             continue;
         for (unsigned si = 0; si < 2; ++si) {
             for (unsigned e = 1; e < NumTierExperts; ++e) {
-                if (!(st->waiting[si] & (1 << e)))
+                if (!(st->waiting[si] & (1 << e)) || !(s_mix & (1 << e)))
                     continue;
                 s_stats.reevaluations++;
                 if (pureVote(e, si, function, *st, fingerprint, heavy, top, idle[si], tick, now) != No)
@@ -804,6 +1061,89 @@ void reevaluateWaiters()
     }
 }
 
+// Ghost scoring of one decision point, after the decision, so the profile fingerprint is
+// computed only when needed: to check an active ghost, or to snapshot an un-acted Go.
+template<typename ScoringFingerprintOf>
+void scoreDecision(CodeBlock* baseline, unsigned si, const Vote* v, Vote acted, std::optional<uint64_t> ownFingerprint, const ScoringFingerprintOf& scoringFingerprintOf)
+{
+    bool needFingerprint = false;
+    {
+        Locker locker { s_lock };
+        FnState& st = fnState(baseline);
+        for (unsigned e = 0; e < NumTierExperts; ++e)
+            needFingerprint |= st.ghostActive[si][e] || (acted == No && v[e] == Yes);
+    }
+    uint64_t scoringFp = needFingerprint ? scoringFingerprintOf(ownFingerprint ? *ownFingerprint : profileFingerprint(baseline)) : 0;
+
+    Locker locker { s_lock };
+    FnState& st = fnState(baseline);
+    uint64_t point = ++s_pointId;
+    classOf(baseline, st);
+
+    // Un-acted Go votes whose profile has since changed: their compile would have exited.
+    uint8_t superseded = 0;
+    for (unsigned e = 0; e < NumTierExperts; ++e) {
+        if (st.ghostActive[si][e] && st.ghostFingerprint[si][e] != scoringFp) {
+            superseded |= 1 << e;
+            st.ghostActive[si][e] = false;
+        }
+    }
+    for (unsigned e = 0; e < NumTierExperts; ++e) {
+        if (!(superseded & (1 << e)))
+            continue;
+        st.raw.synthetic[si][e]++;
+        if ((superseded & (1 << TJsc)) && st.ghostPoint[si][TJsc] == st.ghostPoint[si][e])
+            st.raw.syntheticJsc[si][e]++;
+        if (mixerOn() && (s_mix & (1 << e))) {
+            // Online price: this function's mean jettison cost at this step so far, else its
+            // class's; deferred until one has been observed.
+            if (auto mean = onlineEarlyMean(st, si))
+                chargeWeight(st, si, e, *mean);
+            else {
+                st.pendingSynthetic[si][e]++;
+                st.hasPending = true;
+                s_unpricedUpdates++;
+            }
+        }
+    }
+
+    uint8_t awake = 0;
+    for (unsigned e = 0; e < NumTierExperts; ++e) {
+        st.latest[si][e] = v[e];
+        if (v[e] != Abstain)
+            awake |= 1 << e;
+    }
+    st.latestAwake[si] = awake;
+    st.haveLatest[si] = true;
+
+    if (acted == Yes) {
+        uint8_t yes = 0, wait = 0;
+        for (unsigned e = 0; e < NumTierExperts; ++e) {
+            if (v[e] == Yes)
+                yes |= 1 << e;
+            else if (v[e] == No)
+                wait |= 1 << e;
+            st.ghostActive[si][e] = false; // the real compile supersedes every ghost
+        }
+        st.compileYesMask[si] = yes;
+        st.compileAwakeMask[si] = awake;
+        // Experts that voted Wait are charged the extra time they would have kept the function
+        // in the lower tier, until their re-evaluated vote turns Go.
+        st.waiting[si] = wait;
+        st.waitingAwake[si] = awake;
+        if (wait)
+            s_waiters->add(baseline);
+        return;
+    }
+    for (unsigned e = 0; e < NumTierExperts; ++e) {
+        if (v[e] == Yes && !st.ghostActive[si][e]) {
+            st.ghostActive[si][e] = true;
+            st.ghostFingerprint[si][e] = scoringFp;
+            st.ghostPoint[si][e] = point;
+        }
+    }
+}
+
 bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
 {
     reevaluateWaiters();
@@ -812,25 +1152,33 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
     bool ftl = isFTLDP(dp);
     bool lb = dp == DP::LLIntToBaseline;
 
-    // Inputs gathered outside s_lock.
-    uint64_t fingerprint = lb ? 0 : profileFingerprint(baseline);
+    // Inputs gathered outside s_lock. Lean build: only the mix's experts compute their inputs.
+    bool inMix[NumTierExperts];
+    for (unsigned e = 0; e < NumTierExperts; ++e)
+        inMix[e] = s_mix & (1 << e);
+    // The profile fingerprint feeds Quiescence and ghost scoring's synthetic exits. Without
+    // Quiescence in the mix it is computed only when scoring needs it (after the decision).
+    std::optional<uint64_t> fingerprint;
+    if (!lb && inMix[TQuiescence])
+        fingerprint = profileFingerprint(baseline);
     // Ghost scoring: the sites a ghost compile would have used are approximated by this
     // function's own profiles plus those of the inlinees of its most recent real compile
     // (approved approximation (a), validated by the ghost-vs-live ranking check).
-    uint64_t scoringFingerprint = fingerprint;
-    if (!lb) {
+    auto scoringFingerprintOf = [&](uint64_t own) {
         Vector<CodeBlock*> inlinees;
         {
             Locker locker { s_lock };
             if (FnState* st = findFnState(baseline))
                 inlinees = st->inlinees;
         }
+        uint64_t h = own;
         for (CodeBlock* inlinee : inlinees)
-            scoringFingerprint = WTF::pairIntHash(static_cast<unsigned>(scoringFingerprint), static_cast<unsigned>(profileFingerprint(inlinee))) ^ (scoringFingerprint << 1);
-    }
+            h = WTF::pairIntHash(static_cast<unsigned>(h), static_cast<unsigned>(profileFingerprint(inlinee))) ^ (h << 1);
+        return h;
+    };
     MonotonicTime now = MonotonicTime::now();
-    bool heavy = !lb && TierUpTimeAttribution::inLowerTierHeavySet(baseline) && owner->jitType() != JITType::FTLJIT;
-    int64_t idle = lb ? 0 : idleCompilerSlots(ftl);
+    bool heavy = !lb && inMix[TSampleGravity] && TierUpTimeAttribution::inLowerTierHeavySet(baseline) && owner->jitType() != JITType::FTLJIT;
+    int64_t idle = (lb || !inMix[TQueueSlack]) ? 0 : idleCompilerSlots(ftl);
     uint64_t tick = TierUpTimeAttribution::currentTick();
     unsigned cost = baseline->bytecodeCost();
 
@@ -845,7 +1193,9 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         v[TJsc] = jscGo ? Yes : No;
 
         // supply
-        if (lb)
+        if (!inMix[TSupply])
+            v[TSupply] = Abstain;
+        else if (lb)
             v[TSupply] = st.pulled ? Yes : Abstain;
         else if (!isLoopDP(dp)) {
             unsigned budget = inlineBudget(ftl);
@@ -867,14 +1217,14 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         }
 
         // quiescence
-        if (!lb) {
-            bool changed = !st.haveFingerprint || st.fingerprint != fingerprint;
+        if (!lb && inMix[TQuiescence]) {
+            bool changed = !st.haveFingerprint || st.fingerprint != *fingerprint;
             if (changed) {
                 if (st.haveFingerprint) {
                     addGap((now - st.lastChange).milliseconds());
                     st.requireChange = false;
                 }
-                st.fingerprint = fingerprint;
+                st.fingerprint = *fingerprint;
                 st.haveFingerprint = true;
                 st.lastChange = now;
             }
@@ -888,12 +1238,14 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         }
 
         // sample-gravity
-        if (!lb)
+        if (!lb && inMix[TSampleGravity])
             v[TSampleGravity] = heavy ? Yes : No;
 
         // queue-slack
-        if (!lb) {
-            bool recentJettison = st.lastJettisonTickPlusOne && tick + 1 - st.lastJettisonTickPlusOne <= 1;
+        if (!lb && inMix[TQueueSlack]) {
+            // Recent jettison: within the last two 10 ms periods, by timestamp (no sampler needed).
+            UNUSED_PARAM(tick);
+            bool recentJettison = st.lastJettison && (now - st.lastJettison).milliseconds() < 20;
             if (idle > 0)
                 v[TQueueSlack] = recentJettison ? Abstain : Yes;
             else {
@@ -920,38 +1272,20 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
 
         for (unsigned e = 0; e < NumTierExperts; ++e)
             s_stats.tierVotes[e][dpi][v[e]]++;
-        acted = v[s_tierSelected] == Abstain ? v[TJsc] : v[s_tierSelected];
+        if (mixerOn()) {
+            // The awake expert in the mix with the largest weight in this decision's bucket acts
+            // (ties: jsc-default, then lower index).
+            const double* w = s_weight[classOf(baseline, st)][ftl ? 1 : 0];
+            unsigned chosen = TJsc;
+            for (unsigned e = 1; e < NumTierExperts; ++e) {
+                if (inMix[e] && v[e] != Abstain && w[e] > w[chosen])
+                    chosen = e;
+            }
+            s_mixerChose[chosen]++;
+            acted = v[chosen];
+        } else
+            acted = v[s_tierSelected] == Abstain ? v[TJsc] : v[s_tierSelected];
 
-        // ghost scoring
-        uint64_t point = ++s_pointId;
-        if (!lb) {
-            unsigned si = ftl ? 1 : 0;
-            classOf(baseline, st);
-            // Un-acted Go votes whose profile has since changed: their compile would have exited.
-            // Priced at the end of the run from this run's real jettison costs.
-            uint8_t superseded = 0;
-            for (unsigned e = 0; e < NumTierExperts; ++e) {
-                if (st.ghostActive[si][e] && st.ghostFingerprint[si][e] != scoringFingerprint) {
-                    superseded |= 1 << e;
-                    st.ghostActive[si][e] = false;
-                }
-            }
-            for (unsigned e = 0; e < NumTierExperts; ++e) {
-                if (!(superseded & (1 << e)))
-                    continue;
-                st.raw.synthetic[si][e]++;
-                if ((superseded & (1 << TJsc)) && st.ghostPoint[si][TJsc] == st.ghostPoint[si][e])
-                    st.raw.syntheticJsc[si][e]++;
-            }
-            uint8_t awake = 0;
-            for (unsigned e = 0; e < NumTierExperts; ++e) {
-                st.latest[si][e] = v[e];
-                if (v[e] != Abstain)
-                    awake |= 1 << e;
-            }
-            st.latestAwake[si] = awake;
-            st.haveLatest[si] = true;
-        }
         if (isRetier) {
             unsigned r = static_cast<unsigned>(DP::Retier);
             Vote retierActed = (s_deoptSelected == DCauseSplit && retier == Yes) ? Yes : acted;
@@ -966,35 +1300,6 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
             if (lb)
                 st.pulled = false;
         }
-        if (!lb) {
-            unsigned si = ftl ? 1 : 0;
-            if (acted == Yes) {
-                uint8_t yes = 0, wait = 0;
-                for (unsigned e = 0; e < NumTierExperts; ++e) {
-                    if (v[e] == Yes)
-                        yes |= 1 << e;
-                    else if (v[e] == No)
-                        wait |= 1 << e;
-                    st.ghostActive[si][e] = false; // the real compile supersedes every ghost
-                }
-                st.compileYesMask[si] = yes;
-                st.compileAwakeMask[si] = st.latestAwake[si];
-                // Experts that voted Wait are charged the extra time they would have kept the
-                // function in the lower tier, until their re-evaluated vote turns Go.
-                st.waiting[si] = wait;
-                st.waitingAwake[si] = st.latestAwake[si];
-                if (wait)
-                    s_waiters->add(baseline);
-            } else {
-                for (unsigned e = 0; e < NumTierExperts; ++e) {
-                    if (v[e] == Yes && !st.ghostActive[si][e]) {
-                        st.ghostActive[si][e] = true;
-                        st.ghostFingerprint[si][e] = scoringFingerprint;
-                        st.ghostPoint[si][e] = point;
-                    }
-                }
-            }
-        }
         s_stats.acted[dpi][acted]++;
         if ((acted == Yes) != jscGo)
             s_stats.actedDiffersFromJsc[dpi]++;
@@ -1004,6 +1309,9 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
         else
             pullTarget = nullptr;
     }
+
+    if (!lb)
+        scoreDecision(baseline, ftl ? 1 : 0, v, acted, fingerprint, scoringFingerprintOf);
 
     if (pullTarget)
         pullTarget->jitNextInvocation(); // the pulled callee's next LLInt check is now
@@ -1177,7 +1485,7 @@ void noteOptimizedInstalled(CodeBlock* machine)
         FnState& st = fnState(baseline);
         classOf(baseline, st);
         // Re-tiered: a jettison at this step is closed with the time it cost.
-        closePendingEarly(st, tier);
+        closePendingEarly(st, tier, baseline);
         st.installed[tier] = true;
         st.installedLowerMs[tier][0] = st.installedLowerMs[tier][1] = 0;
         if (tier == 1)
@@ -1206,6 +1514,7 @@ void noteJettison(CodeBlock* optimized, Profiler::JettisonReason reason)
         Locker locker { s_lock };
         FnState& st = fnState(baseline);
         st.lastJettisonTickPlusOne = tick + 1;
+        st.lastJettison = MonotonicTime::now();
         unsigned si = optimized->jitType() == JITType::FTLJIT ? 1 : 0;
         if (Profiler::isSpeculationFailure(reason)) {
             st.requireChange = true;
@@ -1271,8 +1580,11 @@ void noteSample(CodeBlock* root, unsigned tier)
             anyGo |= st->latest[si][e] == Yes;
         if (anyGo) {
             for (unsigned e = 0; e < NumTierExperts; ++e) {
-                if (st->latest[si][e] == No)
+                if (st->latest[si][e] == No) {
                     st->raw.late[si][e] += ms;
+                    if (mixerOn() && (s_mix & (1 << e)))
+                        chargeFaster(root, *st, si, e, si ? 2 : 0, ms);
+                }
                 if (st->latest[si][TJsc] == No && (st->latestAwake[si] & (1 << e)))
                     st->raw.lateJsc[si][e] += ms;
             }
@@ -1283,9 +1595,13 @@ void noteSample(CodeBlock* root, unsigned tier)
         if (!st->waiting[si] || t <= si)
             continue;
         unsigned h = t - 1; // 0 DFG, 1 FTL
+        // Kept in Baseline instead of DFG (B,D) / FTL (B,F), or in DFG instead of FTL (D,F).
         for (unsigned e = 0; e < NumTierExperts; ++e) {
-            if (st->waiting[si] & (1 << e))
+            if (st->waiting[si] & (1 << e)) {
                 st->raw.delayed[si][h][e] += ms;
+                if (mixerOn() && (s_mix & (1 << e)))
+                    chargeSlower(root, *st, si, e, si ? 2 : (h ? 1 : 0), ms);
+            }
             if ((st->waiting[si] & (1 << TJsc)) && (st->waitingAwake[si] & (1 << e)))
                 st->raw.delayedJsc[si][h][e] += ms;
         }

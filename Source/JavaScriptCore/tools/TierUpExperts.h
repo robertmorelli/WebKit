@@ -4,6 +4,10 @@
  * Options (all default unset = upstream behaviour; every hook is one load of a cached bool):
  *   --tierUpExpert=jsc-default|supply|quiescence|sample-gravity|queue-slack
  *   --deoptExpert=jsc-default|refutation|cause-split
+ *   --tierUpExpert=mixer: the full-information mixer (notes/decisions.md D5): the awake expert in
+ *   --tierUpMixExperts with the largest multiplicative weight in the decision's (class, step)
+ *   bucket acts; weights are charged online with the ghost losses.
+ *   --tierUpMixExperts=<list>: lean build, only these experts (and jsc-default) compute votes.
  * Setting either option (jsc-default included) turns on the ghost machinery: at EVERY decision
  * point below, EVERY expert of that family computes its full vote (or abstains, sleeping-experts
  * style) and the vote is counted; only the selected expert's vote is acted on, and where it
@@ -86,10 +90,12 @@ namespace TierUpExperts {
 enum class DP : uint8_t { LLIntToBaseline, BaselineToDFG, BaselineLoopOSR, DFGToFTL, DFGLoopOSR, Retier, Exit, LoopReoptimize, Count };
 
 extern bool g_enabled;
+extern bool g_deoptEnabled; // a --deoptExpert is set: exit ramps call in, refutation records predictions
 
 void initialize(VM&);
 void shutdown(VM&);
 inline bool enabled() { return g_enabled; }
+inline bool deoptEnabled() { return g_deoptEnabled; }
 
 // ---- tier-up decision points. `jscGo` is JSC's own decision at this point, computed by the
 // caller with JSC's code. Returns whether to compile now. If the acted decision is to wait while

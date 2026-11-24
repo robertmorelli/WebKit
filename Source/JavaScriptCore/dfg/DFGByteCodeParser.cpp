@@ -766,7 +766,7 @@ private:
         ASSERT(node->origin.semantic.bytecodeIndex() == m_currentIndex);
         LazyOperandValueProfileKey key(m_currentIndex, node->operand());
         SpeculatedType prediction = m_inlineStackTop->m_lazyOperands.prediction(key);
-        if (TierUpExperts::enabled()) [[unlikely]]
+        if (TierUpExperts::deoptEnabled()) [[unlikely]]
             TierUpExperts::noteConsumedPrediction(m_codeBlock, m_inlineStackTop->m_profiledBlock, TierUpExperts::ProfileKind::Lazy, m_currentIndex, node->operand().asBits(), prediction);
         node->variableAccessData()->predict(prediction);
         return node;
@@ -1273,7 +1273,7 @@ private:
 
             JSValue* specFailValue = inlineStackEntry->m_specFailValueProfileBuckets.get(bytecodeIndex);
             SpeculatedType prediction = codeBlock->valueProfilePredictionForBytecodeIndex(codeOrigin.bytecodeIndex(), specFailValue);
-            if (TierUpExperts::enabled()) [[unlikely]]
+            if (TierUpExperts::deoptEnabled()) [[unlikely]]
                 TierUpExperts::noteConsumedPrediction(m_codeBlock, codeBlock, TierUpExperts::ProfileKind::Bytecode, codeOrigin.bytecodeIndex(), 0, prediction);
             auto* fuzzerAgent = m_vm->fuzzerAgent();
             if (fuzzerAgent) [[unlikely]]
@@ -2633,7 +2633,7 @@ bool ByteCodeParser::handleVarargsInlining(Node* callTargetNode, Operand result,
             if (codeBlock && argument < static_cast<unsigned>(codeBlock->numParameters())) {
                 ArgumentValueProfile& profile = codeBlock->valueProfileForArgument(argument);
                 SpeculatedType prediction = profile.computeUpdatedPrediction();
-                if (TierUpExperts::enabled()) [[unlikely]]
+                if (TierUpExperts::deoptEnabled()) [[unlikely]]
                     TierUpExperts::noteConsumedPrediction(m_codeBlock, codeBlock, TierUpExperts::ProfileKind::Argument, BytecodeIndex(0), argument, prediction);
                 variable->predict(prediction);
             }

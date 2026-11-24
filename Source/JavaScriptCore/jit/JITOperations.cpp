@@ -3011,7 +3011,7 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
         // shouldReoptimizeFromLoopNow() to always return true. But we make it do some
         // additional checking anyway, to reduce the amount of recompilation thrashing.
         bool reoptimizeFromLoop = replacement->shouldReoptimizeFromLoopNow();
-        if (TierUpExperts::enabled()) [[unlikely]]
+        if (TierUpExperts::deoptEnabled()) [[unlikely]]
             reoptimizeFromLoop = TierUpExperts::loopReoptimize(replacement, reoptimizeFromLoop);
         if (reoptimizeFromLoop) {
             CODEBLOCK_LOG_EVENT(codeBlock, "delayOptimizeToDFG", ("should reoptimize from loop now"));

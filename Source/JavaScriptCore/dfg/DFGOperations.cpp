@@ -6617,7 +6617,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerReoptimizationNow, void, (Code
     // In order to trigger reoptimization, one of two things must have happened:
     // 1) We exited more than some number of times.
     // 2) We exited and got stuck in a loop, and now we're exiting again.
-    if (TierUpExperts::enabled()) [[unlikely]] {
+    if (TierUpExperts::deoptEnabled()) [[unlikely]] {
         // minuteman: the exit ramp already decided (TierUpExperts::exitDecision, which also
         // computes JSC's own rule below as the jsc-default vote).
         if (TierUpExperts::takeJettisonRequest(optimizedCodeBlock))

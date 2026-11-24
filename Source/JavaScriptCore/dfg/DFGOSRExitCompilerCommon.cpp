@@ -62,7 +62,7 @@ void handleExitCounts(VM& vm, CCallHelpers& jit, const OSRExitBase& exit, const 
     jit.add32(AssemblyHelpers::TrustedImm32(1), GPRInfo::regT2);
     jit.store32(GPRInfo::regT2, AssemblyHelpers::Address(GPRInfo::regT3, CodeBlock::offsetOfOSRExitCounter()));
 
-    if (TierUpExperts::enabled()) [[unlikely]] {
+    if (TierUpExperts::deoptEnabled()) [[unlikely]] {
         // minuteman: every exit is a deopt decision point. All deopt experts vote in C++
         // (jsc-default computes JSC's own rule there); the acted decision comes back in regT1.
         const TierUpExperts::ExitSiteInfo* info = TierUpExperts::retainExitSiteInfo(jit.codeBlock(), exit, valueProfile);
