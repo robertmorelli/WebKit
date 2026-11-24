@@ -74,6 +74,8 @@
 #include "ProfilerJettisonReason.h"
 #include "SpeculatedType.h"
 #include <cstdint>
+#include <wtf/MonotonicTime.h>
+#include <wtf/Vector.h>
 
 namespace JSC {
 
@@ -156,6 +158,39 @@ uint64_t* workCounterFor(CodeBlock* machine, bool ftl);
 // From the time-attribution sampler thread: one sample charged to (`root`, tier), with tier as
 // TierUpTimeAttribution::Tier. Drives the "too late" ghost loss.
 void noteSample(CodeBlock* root, unsigned tier);
+
+// ---- D49 compile-queue ordering experts (--tierUpOrderExpert). Decision point: every dequeue
+// with >= 2 dequeueable plans (all tiers whose concurrency limit allows a dequeue). Every
+// ordering expert computes its pick there; the acting expert's pick is dequeued.
+//   fifo            JSC's own: lowest dequeueable tier, oldest plan.
+//   newest          lowest dequeueable tier, most recently enqueued plan.
+//   loop-bound      lowest dequeueable tier, oldest loop OSR-entry plan (DFG with an OSR-entry
+//                   bytecode index, or FTLForOSREntry); none: oldest.
+//   smallest        lowest dequeueable tier, fewest bytecode instructions (ties: oldest).
+//   caller-first    lowest dequeueable tier, oldest plan whose function has a linked call edge to
+//                   another waiting plan's function in that tier; none: oldest.
+//   global-arrival  oldest plan across all dequeueable tiers (ignores tier priority).
+//   live-first      lowest dequeueable tier, oldest plan whose function ran since it was enqueued:
+//                   the execution counter JSC's own tier-up check uses in the tier it runs in
+//                   while waiting moved (LLInt / Baseline execute counter, DFG tierUpCounter);
+//                   none: oldest.
+//   pagerank        lowest dequeueable tier, highest PageRank of the function on the linked
+//                   call graph (callers -> callees, unweighted; d = 0.85, 20 power iterations,
+//                   recomputed at most every 10 ms on the sampler thread; ties: oldest).
+extern bool g_orderEnabled;
+inline bool orderingEnabled() { return g_orderEnabled; }
+struct OrderCandidate {
+    unsigned tier; // JITPlan::Tier
+    MonotonicTime enqueued;
+    unsigned size; // bytecode instructions
+    bool loopEntry;
+    bool ranSinceEnqueue; // live-first input (JSC execution counter moved since enqueue)
+    CodeBlock* baseline; // key only; never dereferenced here
+};
+// Candidates in tier order, then queue order. Returns the index to dequeue. Worklist lock held.
+unsigned orderPick(const Vector<OrderCandidate, 16>&);
+// Sampler thread, every interval: recomputes the call graph's PageRank when due.
+void tick();
 
 } // namespace TierUpExperts
 } // namespace JSC

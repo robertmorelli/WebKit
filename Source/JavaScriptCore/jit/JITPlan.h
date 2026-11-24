@@ -28,6 +28,7 @@
 #if ENABLE(JIT)
 
 #include "CompilationResult.h"
+#include "ExecutionCounter.h"
 #include "JITCode.h"
 #include "JITCompilationKey.h"
 #include "JITCompilationMode.h"
@@ -140,6 +141,16 @@ public:
     MonotonicTime m_minutemanEnqueued; // minuteman: queue-wait measurement (TierUpExperts)
     unsigned m_minutemanAhead { 0 };   // plans already queued in its tier when it was enqueued
     unsigned m_minutemanAheadQueued { 0 }; // D45: of those, waiting (not compiling)
+    // D49 ordering experts: inputs snapshotted at enqueue on the main thread.
+    unsigned m_minutemanSize { 0 };
+    bool m_minutemanLoopEntry { false };
+    CodeBlock* m_minutemanBaseline { nullptr };
+    // live-first: the counter JSC's own tier-up check counts in the tier the function runs in while
+    // this plan waits (LLInt execute counter, Baseline execute counter, DFG tierUpCounter), and its
+    // count() at enqueue. Owned by CodeBlocks the plan keeps alive.
+    const BaselineExecutionCounter* m_minutemanLowerCounter { nullptr };
+    const UpperTierExecutionCounter* m_minutemanUpperCounter { nullptr };
+    double m_minutemanCountAtEnqueue { 0 };
 protected:
     VM* m_vm;
     CodeBlock* m_codeBlock;

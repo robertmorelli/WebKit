@@ -478,6 +478,7 @@ private:
     void loop()
     {
         while (!m_shutdown.load()) {
+            TierUpExperts::tick(); // D49: PageRank recompute when due (no-op unless ordering is on)
 #if MINUTEMAN_SELF_SAMPLING
             if (m_selfSampling) {
                 drain();

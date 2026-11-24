@@ -47,6 +47,7 @@ struct MinutemanValueProfileAccess {
 namespace TierUpExperts {
 
 bool g_enabled { false };
+bool g_orderEnabled { false };
 bool g_deoptEnabled { false };
 
 namespace {
@@ -217,6 +218,27 @@ struct Record {
 Lock s_lock;
 HashMap<CodeBlock*, std::unique_ptr<FnState>>* s_fn;
 HashMap<CodeBlock*, std::unique_ptr<EdgeState>>* s_edges;
+// D49 ordering experts.
+enum OrderExpert { OFifo, ONewest, OLoopBound, OSmallest, OCallerFirst, OGlobalArrival, OLiveFirst, OPageRank, NumOrderExperts };
+const char* const kOrderNames[NumOrderExperts] = { "fifo", "newest", "loop-bound", "smallest", "caller-first", "global-arrival", "live-first", "pagerank" };
+unsigned s_orderSelected { OFifo };
+// Linked call graph over baseline CodeBlocks (every link, independent of Supply's slots).
+HashMap<CodeBlock*, HashSet<CodeBlock*>>* s_callOut;
+HashMap<CodeBlock*, HashSet<CodeBlock*>>* s_callIn;
+HashMap<CodeBlock*, double>* s_rank;
+uint64_t s_graphVersion { 0 };
+struct OrderStats {
+    uint64_t dps { 0 };
+    uint64_t dpsByTier[3] { 0, 0, 0 };
+    uint64_t differsFromFifo[NumOrderExperts] { };
+    uint64_t agreesWithActed[NumOrderExperts] { };
+    uint64_t pickedOtherTier[NumOrderExperts] { }; // pick outside the lowest dequeueable tier
+    uint64_t rankComputes { 0 };
+    double rankMs { 0 };
+    uint64_t maxNodes { 0 };
+    uint64_t candidates { 0 }, candLoop { 0 }, candLive { 0 }, firstLive { 0 }; // inputs seen, lowest tier
+};
+OrderStats s_order;
 HashMap<CodeBlock*, std::unique_ptr<OptState>>* s_opt;
 Stats s_stats;
 Vector<Record>* s_retired;
@@ -803,6 +825,13 @@ void dump()
     Locker locker { s_lock };
     dataLogLn("tierUpExperts: selected tierUp=", kTierNames[s_tierSelected], " deopt=", kDeoptNames[s_deoptSelected],
         " mix=", static_cast<unsigned>(s_mix), " pulls=", s_stats.pulls, " quietGaps=", s_stats.quietGaps);
+    if (g_orderEnabled) {
+        dataLogLn("tierUpExperts: order acting=", kOrderNames[s_orderSelected], " dps=", s_order.dps, " byTier=", s_order.dpsByTier[0], "/", s_order.dpsByTier[1], "/", s_order.dpsByTier[2],
+            " graphNodesMax=", s_order.maxNodes, " candidates=", s_order.candidates, " loopEntry=", s_order.candLoop, " live=", s_order.candLive, " oldestLive=", s_order.firstLive, " rankComputes=", s_order.rankComputes, " rankMs=", s_order.rankMs);
+        for (unsigned e = 0; e < NumOrderExperts; ++e)
+            dataLogLn("tierUpExperts: order expert=", kOrderNames[e], " computed=", s_order.dps, " differsFromFifo=", s_order.differsFromFifo[e],
+                " agreesWithActed=", s_order.agreesWithActed[e], " pickedOtherTier=", s_order.pickedOtherTier[e]);
+    }
     if (Options::tierUpExpertsQueueContention()) {
         double wallMs = (MonotonicTime::now() - s_vmStart).milliseconds();
         for (unsigned s = 0; s < 2; ++s) {
@@ -1071,6 +1100,20 @@ void initialize(VM& vm)
     }
     RELEASE_ASSERT_WITH_MESSAGE(found, "tierUpExperts: unknown --deoptExpert");
     RELEASE_ASSERT_WITH_MESSAGE(Options::tierUpTimeAttribution(), "tierUpExperts: the experts need --tierUpTimeAttribution=1");
+    if (const char8_t* o = Options::tierUpOrderExpert()) {
+        bool known = false;
+        for (unsigned e = 0; e < NumOrderExperts; ++e) {
+            if (is(o, kOrderNames[e])) {
+                s_orderSelected = e;
+                known = true;
+            }
+        }
+        RELEASE_ASSERT_WITH_MESSAGE(known, "tierUpExperts: unknown --tierUpOrderExpert");
+        s_callOut = new HashMap<CodeBlock*, HashSet<CodeBlock*>>();
+        s_callIn = new HashMap<CodeBlock*, HashSet<CodeBlock*>>();
+        s_rank = new HashMap<CodeBlock*, double>();
+        g_orderEnabled = true;
+    }
     g_enabled = true;
     if (Options::verboseTierUpExperts())
         std::atexit(dump);
@@ -1085,6 +1128,25 @@ void shutdown(VM& vm)
 void forget(CodeBlock* codeBlock)
 {
     Locker locker { s_lock };
+    if (g_orderEnabled) {
+        if (auto out = s_callOut->find(codeBlock); out != s_callOut->end()) {
+            for (CodeBlock* callee : out->value) {
+                if (auto in = s_callIn->find(callee); in != s_callIn->end())
+                    in->value.remove(codeBlock);
+            }
+            s_callOut->remove(out);
+            s_graphVersion++;
+        }
+        if (auto in = s_callIn->find(codeBlock); in != s_callIn->end()) {
+            for (CodeBlock* caller : in->value) {
+                if (auto out = s_callOut->find(caller); out != s_callOut->end())
+                    out->value.remove(codeBlock);
+            }
+            s_callIn->remove(in);
+            s_graphVersion++;
+        }
+        s_rank->remove(codeBlock);
+    }
     if (auto e = s_edges->find(codeBlock); e != s_edges->end()) {
         EdgeState& es = *e->value;
         for (CodeBlock* caller : es.trackedBy) {
@@ -1715,6 +1777,19 @@ bool loopReoptimize(CodeBlock* optimized, bool jscJettison)
 // ---------------------------------------------------------------- observations
 void noteIncomingCall(CodeBlock* callee, JSCell* caller)
 {
+    if (g_orderEnabled) {
+        if (CodeBlock* callerCodeBlock = dynamicDowncast<CodeBlock>(caller)) {
+            CodeBlock* from = baselineOf(callerCodeBlock);
+            CodeBlock* to = baselineOf(callee);
+            if (from != to) {
+                Locker locker { s_lock };
+                if (s_callOut->ensure(from, [] { return HashSet<CodeBlock*>(); }).iterator->value.add(to).isNewEntry) {
+                    s_callIn->ensure(to, [] { return HashSet<CodeBlock*>(); }).iterator->value.add(from);
+                    s_graphVersion++;
+                }
+            }
+        }
+    }
     if (!(s_mix & ((1 << TSupply) | (1 << TTierInversion))))
         return; // call edges feed only Supply and tier-inversion
     CodeBlock* callerCodeBlock = dynamicDowncast<CodeBlock>(caller);
@@ -1962,6 +2037,151 @@ void noteSample(CodeBlock* root, unsigned tier)
             }
         }
     }
+}
+
+unsigned orderPick(const Vector<OrderCandidate, 16>& c)
+{
+    // c is in tier order: [0, end) is the lowest dequeueable tier, which JSC serves first.
+    unsigned end = 1;
+    while (end < c.size() && c[end].tier == c[0].tier)
+        ++end;
+    unsigned pick[NumOrderExperts];
+    Locker locker { s_lock };
+    pick[OFifo] = 0;
+    pick[ONewest] = end - 1;
+    pick[OLoopBound] = 0;
+    for (unsigned i = 0; i < end; ++i) {
+        if (c[i].loopEntry) {
+            pick[OLoopBound] = i;
+            break;
+        }
+    }
+    pick[OSmallest] = 0;
+    for (unsigned i = 1; i < end; ++i) {
+        if (c[i].size < c[pick[OSmallest]].size)
+            pick[OSmallest] = i;
+    }
+    pick[OCallerFirst] = 0;
+    for (unsigned i = 0; i < end && !pick[OCallerFirst]; ++i) {
+        auto out = s_callOut->find(c[i].baseline);
+        if (out == s_callOut->end())
+            continue;
+        bool callsWaiting = false;
+        for (unsigned j = 0; j < end && !callsWaiting; ++j)
+            callsWaiting = j != i && c[j].baseline != c[i].baseline && out->value.contains(c[j].baseline);
+        if (callsWaiting) {
+            pick[OCallerFirst] = i;
+            break;
+        }
+    }
+    pick[OGlobalArrival] = 0;
+    for (unsigned i = 1; i < c.size(); ++i) {
+        if (c[i].enqueued < c[pick[OGlobalArrival]].enqueued)
+            pick[OGlobalArrival] = i;
+    }
+    pick[OLiveFirst] = 0;
+    for (unsigned i = 0; i < end; ++i) {
+        if (c[i].ranSinceEnqueue) {
+            pick[OLiveFirst] = i;
+            break;
+        }
+    }
+    pick[OPageRank] = 0;
+    double best = -1;
+    for (unsigned i = 0; i < end; ++i) {
+        double r = s_rank->get(c[i].baseline);
+        if (r > best) {
+            best = r;
+            pick[OPageRank] = i;
+        }
+    }
+    unsigned acted = pick[s_orderSelected];
+    for (unsigned i = 0; i < end; ++i) {
+        bool live = c[i].ranSinceEnqueue;
+        s_order.candidates++;
+        s_order.candLoop += c[i].loopEntry;
+        s_order.candLive += live;
+        s_order.firstLive += live && !i;
+    }
+    s_order.dps++;
+    s_order.dpsByTier[std::min(c[0].tier, 2u)]++;
+    for (unsigned e = 0; e < NumOrderExperts; ++e) {
+        s_order.differsFromFifo[e] += pick[e] != pick[OFifo];
+        s_order.agreesWithActed[e] += pick[e] == acted;
+        s_order.pickedOtherTier[e] += pick[e] >= end;
+    }
+    return acted;
+}
+
+void tick()
+{
+    if (!g_orderEnabled)
+        return;
+    static MonotonicTime s_lastRank;
+    static uint64_t s_rankedVersion { 0 };
+    MonotonicTime start = MonotonicTime::now();
+    if (start - s_lastRank < Seconds::fromMilliseconds(10))
+        return;
+    Vector<CodeBlock*> nodes;
+    HashMap<CodeBlock*, unsigned> index;
+    Vector<Vector<unsigned>> out;
+    {
+        Locker locker { s_lock };
+        if (s_graphVersion == s_rankedVersion)
+            return;
+        s_rankedVersion = s_graphVersion;
+        auto node = [&](CodeBlock* b) {
+            auto r = index.add(b, nodes.size());
+            if (r.isNewEntry) {
+                nodes.append(b);
+                out.append(Vector<unsigned>());
+            }
+            return r.iterator->value;
+        };
+        for (auto& [from, callees] : *s_callOut) {
+            unsigned f = node(from);
+            for (CodeBlock* to : callees) {
+                unsigned t = node(to);
+                out[f].append(t);
+            }
+        }
+    }
+    s_lastRank = start;
+    size_t n = nodes.size();
+    if (!n)
+        return;
+    // PageRank (Brin & Page 1998): damping 0.85, uniform teleport, dangling mass spread uniformly,
+    // 20 power iterations. Constants fixed, not swept.
+    constexpr double d = 0.85;
+    Vector<double> r(n, [&](size_t) { return 1.0 / n; });
+    Vector<double> next(n, [](size_t) { return 0.0; });
+    for (unsigned iter = 0; iter < 20; ++iter) {
+        double dangling = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (out[i].isEmpty())
+                dangling += r[i];
+        }
+        double base = (1 - d) / n + d * dangling / n;
+        for (size_t i = 0; i < n; ++i)
+            next[i] = base;
+        for (size_t i = 0; i < n; ++i) {
+            if (out[i].isEmpty())
+                continue;
+            double share = d * r[i] / out[i].size();
+            for (unsigned t : out[i])
+                next[t] += share;
+        }
+        std::swap(r, next);
+    }
+    Locker locker { s_lock };
+    s_rank->clear();
+    for (size_t i = 0; i < n; ++i) {
+        if (s_callOut->contains(nodes[i]) || s_callIn->contains(nodes[i])) // not forgotten meanwhile
+            s_rank->set(nodes[i], r[i]);
+    }
+    s_order.rankComputes++;
+    s_order.rankMs += (MonotonicTime::now() - start).milliseconds();
+    s_order.maxNodes = std::max<uint64_t>(s_order.maxNodes, n);
 }
 
 void noteEnqueued(CodeBlock* baseline, unsigned step)

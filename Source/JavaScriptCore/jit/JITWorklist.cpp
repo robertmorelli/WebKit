@@ -37,6 +37,9 @@
 #include "JITWorklistThread.h"
 #include "SlotVisitorInlines.h"
 #include "VMInlines.h"
+#if ENABLE(DFG_JIT)
+#include "DFGPlan.h"
+#endif
 #include <wtf/TZoneMallocInlines.h>
 
 namespace JSC {
@@ -219,6 +222,27 @@ void JITWorklist::wakeThreads(const AbstractLocker& locker, unsigned enqueuedTie
         publishDemand(locker);
 }
 
+// D49 live-first: JSC's counter count() is a running total except that setNewThreshold resets it
+// to 0 and deferIndefinitely to INT32_MIN, which JSC does right after enqueuing (and at other
+// re-arms). So "ran since enqueue" = the count differs from its value at enqueue and is not
+// sitting exactly at a reset value.
+static double minutemanCount(const JITPlan& plan)
+{
+    if (plan.m_minutemanLowerCounter)
+        return plan.m_minutemanLowerCounter->count();
+    if (plan.m_minutemanUpperCounter)
+        return plan.m_minutemanUpperCounter->count();
+    return 0;
+}
+
+static bool minutemanRanSinceEnqueue(const JITPlan& plan)
+{
+    if (!plan.m_minutemanLowerCounter && !plan.m_minutemanUpperCounter)
+        return false;
+    double now = minutemanCount(plan);
+    return now != plan.m_minutemanCountAtEnqueue && now != 0 && now != static_cast<double>(std::numeric_limits<int32_t>::min());
+}
+
 CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
 {
     if (!Options::useConcurrentJIT()) {
@@ -252,6 +276,40 @@ CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
         plan->m_minutemanAheadQueued = m_queues[tier].size();
         if (tier >= static_cast<unsigned>(JITPlan::Tier::DFG) && Options::tierUpExpertsQueueContention())
             TierUpExperts::noteEnqueued(plan->codeBlock()->baselineAlternative(), tier - 1);
+        if (TierUpExperts::orderingEnabled()) {
+            plan->m_minutemanSize = plan->codeBlock()->instructionsSize();
+            plan->m_minutemanBaseline = plan->codeBlock()->baselineAlternative();
+            bool loopEntry = plan->mode() == JITCompilationMode::FTLForOSREntry;
+#if ENABLE(DFG_JIT)
+            if (plan->mode() == JITCompilationMode::DFG || plan->mode() == JITCompilationMode::UnlinkedDFG)
+                {
+                // Function-entry compiles carry BytecodeIndex(0), which is truthy: loop entry = a
+                // nonzero OSR-entry offset (a loop hint).
+                BytecodeIndex entry = static_cast<DFG::Plan&>(plan.get()).osrEntryBytecodeIndex();
+                loopEntry = entry && entry.offset();
+            }
+#endif
+            plan->m_minutemanLoopEntry = loopEntry;
+            switch (plan->tier()) {
+            case JITPlan::Tier::Baseline:
+                plan->m_minutemanLowerCounter = &plan->codeBlock()->llintExecuteCounter();
+                break;
+            case JITPlan::Tier::DFG:
+                plan->m_minutemanLowerCounter = &plan->m_minutemanBaseline->baselineExecuteCounter();
+                break;
+            case JITPlan::Tier::FTL:
+#if ENABLE(DFG_JIT)
+                if (CodeBlock* profiled = static_cast<DFG::Plan&>(plan.get()).minutemanProfiledDFGCodeBlock()) {
+                    if (auto* jitData = profiled->dfgJITData())
+                        plan->m_minutemanUpperCounter = &jitData->tierUpCounter();
+                }
+#endif
+                break;
+            default:
+                break;
+            }
+            plan->m_minutemanCountAtEnqueue = minutemanCount(plan.get());
+        }
     }
     m_queues[tier].append(WTF::move(plan));
     wakeThreads(locker, tier);
@@ -285,11 +343,39 @@ bool JITWorklist::hasDequeueablePlan() const
 
 bool JITWorklist::dequeuePlan(const AbstractLocker&, JITWorkerSlot& slot)
 {
+    // D49: the acting ordering expert may pick any dequeueable plan (every expert computes its
+    // pick in orderPick); otherwise JSC's order: lowest dequeueable tier, oldest plan.
+    std::optional<unsigned> pickedTier;
+    if (TierUpExperts::orderingEnabled()) [[unlikely]] {
+        Vector<TierUpExperts::OrderCandidate, 16> candidates;
+        for (unsigned i = 0; i < static_cast<unsigned>(JITPlan::Tier::Count); ++i) {
+            if (!canDequeueFromTier(i))
+                continue;
+            for (auto& plan : m_queues[i])
+                candidates.append({ i, plan->m_minutemanEnqueued, plan->m_minutemanSize, plan->m_minutemanLoopEntry, minutemanRanSinceEnqueue(*plan), plan->m_minutemanBaseline });
+        }
+        if (candidates.size() >= 2) {
+            unsigned k = TierUpExperts::orderPick(candidates);
+            unsigned tier = candidates[k].tier;
+            unsigned position = k;
+            for (unsigned j = 0; j < k; ++j)
+                position -= candidates[j].tier != tier ? 1 : 0;
+            auto it = m_queues[tier].begin();
+            for (unsigned j = 0; j < position; ++j)
+                ++it;
+            slot.m_plan = WTF::move(*it);
+            m_queues[tier].remove(it);
+            pickedTier = tier;
+        }
+    }
     for (unsigned i = 0; i < static_cast<unsigned>(JITPlan::Tier::Count); ++i) {
-        if (!canDequeueFromTier(i))
+        if (pickedTier && i != *pickedTier)
+            continue;
+        if (!pickedTier && !canDequeueFromTier(i))
             continue;
 
-        slot.m_plan = m_queues[i].takeFirst();
+        if (!pickedTier)
+            slot.m_plan = m_queues[i].takeFirst();
         RELEASE_ASSERT(slot.m_plan);
         if (TierUpExperts::enabled()) [[unlikely]] {
             double waitMs = (MonotonicTime::now() - slot.m_plan->m_minutemanEnqueued).milliseconds();

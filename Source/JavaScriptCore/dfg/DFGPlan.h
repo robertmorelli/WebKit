@@ -104,6 +104,7 @@ public:
     void setCallback(Ref<DeferredCompilationCallback>&& callback) { m_callback = WTF::move(callback); }
 
     std::unique_ptr<JITData> tryFinalizeJITData(const DFG::JITCode&);
+    CodeBlock* minutemanProfiledDFGCodeBlock() const { return m_profiledDFGCodeBlock; } // minuteman D49 (read-only)
 
 private:
     CompilationPath compileInThreadImpl() final;
