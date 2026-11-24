@@ -139,6 +139,7 @@ protected:
 public:
     MonotonicTime m_minutemanEnqueued; // minuteman: queue-wait measurement (TierUpExperts)
     unsigned m_minutemanAhead { 0 };   // plans already queued in its tier when it was enqueued
+    unsigned m_minutemanAheadQueued { 0 }; // D45: of those, waiting (not compiling)
 protected:
     VM* m_vm;
     CodeBlock* m_codeBlock;

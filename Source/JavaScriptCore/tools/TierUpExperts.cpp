@@ -131,6 +131,9 @@ struct FnState { // per baseline CodeBlock
     uint64_t ghostPoint[2][NumTierExperts] { };
     uint8_t waiting[2] { 0, 0 };      // voted Wait at the acted Go and have not re-voted Go since
     bool disagreed { false };         // D42: awake experts have voted both Go and Wait at some point
+    // D45: a compile at this step is waiting in the queue; lower-tier ms the function ran meanwhile
+    bool queued[2] { false, false };
+    double queuedLowerMs[2] { 0, 0 };
     uint8_t waitingAwake[2] { 0, 0 }; // experts awake at that acted Go
     // jettison cost accounting: lower-tier time (ms) by lower tier (0 Baseline, 1 DFG)
     bool installed[2] { false, false };
@@ -240,6 +243,12 @@ uint64_t s_weightUpdates { 0 }, s_unpricedUpdates { 0 }, s_majorityOverrodeJsc {
 // total wait ms, waits >= 1 ms, max wait ms
 struct QueueStats { uint64_t plans { 0 }, behind1 { 0 }, behind2 { 0 }, waits1ms { 0 }; double waitMs { 0 }, maxWaitMs { 0 }; };
 QueueStats s_queue[3];
+// D45 contention per step (DFG, FTL compiles): plans; contested plans (waited alongside another
+// waiting plan); their total wait; contested plans whose function ran in a lower tier while waiting
+// (late) and that lower-tier time; wall time of the run.
+struct ContentionStats { uint64_t plans { 0 }, contested { 0 }, contestedLate { 0 }; double contestedWaitMs { 0 }, contestedLateMs { 0 }, allWaitMs { 0 }; };
+ContentionStats s_contention[2];
+MonotonicTime s_vmStart;
 Lock s_queueLock;
 // online speedup aggregates (per class 0..3 + global 4, per pair): ms lo, work lo, ms hi, work hi
 double s_onlineAgg[5][3][4] { };
@@ -794,6 +803,14 @@ void dump()
     Locker locker { s_lock };
     dataLogLn("tierUpExperts: selected tierUp=", kTierNames[s_tierSelected], " deopt=", kDeoptNames[s_deoptSelected],
         " mix=", static_cast<unsigned>(s_mix), " pulls=", s_stats.pulls, " quietGaps=", s_stats.quietGaps);
+    if (Options::tierUpExpertsQueueContention()) {
+        double wallMs = (MonotonicTime::now() - s_vmStart).milliseconds();
+        for (unsigned s = 0; s < 2; ++s) {
+            const ContentionStats& c = s_contention[s];
+            dataLogLn("tierUpExperts: contention step=", s ? "DFG->FTL" : "Baseline->DFG", " wallMs=", wallMs, " plans=", c.plans, " contested=", c.contested,
+                " contestedWaitMs=", c.contestedWaitMs, " contestedLate=", c.contestedLate, " contestedLateMs=", c.contestedLateMs, " allWaitMs=", c.allWaitMs);
+        }
+    }
     {
         Locker queueLocker { s_queueLock };
         const char* tiers[] = { "Baseline", "DFG", "FTL" };
@@ -984,6 +1001,7 @@ void initialize(VM& vm)
     if (!t && !d)
         return;
     s_vm = &vm;
+    s_vmStart = MonotonicTime::now();
     s_fn = new HashMap<CodeBlock*, std::unique_ptr<FnState>>();
     s_edges = new HashMap<CodeBlock*, std::unique_ptr<EdgeState>>();
     s_opt = new HashMap<CodeBlock*, std::unique_ptr<OptState>>();
@@ -1887,6 +1905,8 @@ void noteSample(CodeBlock* root, unsigned tier)
         // D38: with --tierUpGhostEarlyServiceTime only while the replacement compile is in flight.
         if (st->pendingEarly[si] && (!Options::tierUpGhostEarlyServiceTime() || st->inFlight[si]))
             st->pendingLowerMs[si][t] += ms;
+        if (st->queued[si])
+            st->queuedLowerMs[si] += ms; // D45: ran in a lower tier while its compile waited
     }
     // Late: a Baseline sample scores step 0, a DFG sample step 1, against the latest votes.
     if (t <= 1 && st->haveLatest[t]) {
@@ -1940,6 +1960,40 @@ void noteSample(CodeBlock* root, unsigned tier)
                 if (Options::tierUpMixerRelativeToJsc() && mixerOn() && (s_mix & (1 << e)))
                     chargeSlower(root, *st, si, e, si ? 2 : (h ? 1 : 0), -ms); // D40
             }
+        }
+    }
+}
+
+void noteEnqueued(CodeBlock* baseline, unsigned step)
+{
+    if (!baseline || step > 1)
+        return;
+    Locker locker { s_lock };
+    FnState& st = fnState(baseline);
+    st.queued[step] = true;
+    st.queuedLowerMs[step] = 0;
+}
+
+void noteDequeued(CodeBlock* baseline, unsigned step, double waitMs, unsigned aheadQueued, size_t stillQueued)
+{
+    if (!baseline || step > 1)
+        return;
+    Locker locker { s_lock };
+    FnState* st = findFnState(baseline);
+    double lateMs = 0;
+    if (st && st->queued[step]) {
+        lateMs = st->queuedLowerMs[step];
+        st->queued[step] = false;
+    }
+    ContentionStats& c = s_contention[step];
+    c.plans++;
+    c.allWaitMs += waitMs;
+    if (aheadQueued || stillQueued) {
+        c.contested++;
+        c.contestedWaitMs += waitMs;
+        if (lateMs > 0) {
+            c.contestedLate++;
+            c.contestedLateMs += lateMs;
         }
     }
 }

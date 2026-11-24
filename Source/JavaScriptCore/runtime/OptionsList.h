@@ -177,6 +177,7 @@ bool hasCapacityToUseLargeGigacage();
     v(OptionString, tierUpMixerIncumbent, nullptr, Normal, "minuteman mixer: the expert whose vote stands on exact ties (default jsc-default)"_s) \
     v(OptionString, tierUpMixerPool, nullptr, Normal, "minuteman mixer evidence pooling: bucket (default) or hierarchy (global + class + bucket)"_s) \
     v(Unsigned, tierUpExpertsWorkCountedOneIn, 8, Normal, "minuteman: emit work counters for 1 in N functions (by source position)"_s) \
+    v(Bool, tierUpExpertsQueueContention, false, Normal, "minuteman: measure compile-queue contention per step (D45)"_s) \
     v(Bool, tierUpExpertsCountOnlyDisagreed, false, Normal, "minuteman: DFG/FTL code counts work only for functions the experts have disagreed on before the compile (D42)"_s) \
     v(Bool, tierUpExpertsFTLNoInLoopFlush, false, Normal, "minuteman diagnostic: FTL loop counts flushed only at returns and tail calls"_s) \
     v(Bool, tierUpExpertsDumpWork, false, Normal, "minuteman diagnostic: print each function's work counts per tier at exit"_s) \

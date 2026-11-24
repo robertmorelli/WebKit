@@ -146,6 +146,10 @@ bool countsOptimizedWork(CodeBlock* machine);
 // queue after `waitMs`; `ahead` plans were queued or compiling in its tier when it arrived, and
 // `stillQueued` remain queued behind it.
 void noteQueueWait(unsigned tier, double waitMs, unsigned ahead, size_t stillQueued);
+// D45 (step 7) queue-contention measurement, --tierUpExpertsQueueContention; worklist lock held.
+// Touches only the given plan's own baseline CodeBlock.
+void noteEnqueued(CodeBlock* baseline, unsigned step);
+void noteDequeued(CodeBlock* baseline, unsigned step, double waitMs, unsigned aheadQueued, size_t stillQueued);
 // Work counter (calls + loop back-edges) for optimized code being compiled (compiler thread).
 // Returns a 2-element array: [0] work, [1] calls (D35).
 uint64_t* workCounterFor(CodeBlock* machine, bool ftl);
