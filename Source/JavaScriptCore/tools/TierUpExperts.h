@@ -143,6 +143,7 @@ bool isWorkCounted(CodeBlock*);
 // `stillQueued` remain queued behind it.
 void noteQueueWait(unsigned tier, double waitMs, unsigned ahead, size_t stillQueued);
 // Work counter (calls + loop back-edges) for optimized code being compiled (compiler thread).
+// Returns a 2-element array: [0] work, [1] calls (D35).
 uint64_t* workCounterFor(CodeBlock* machine, bool ftl);
 // From the time-attribution sampler thread: one sample charged to (`root`, tier), with tier as
 // TierUpTimeAttribution::Tier. Drives the "too late" ghost loss.

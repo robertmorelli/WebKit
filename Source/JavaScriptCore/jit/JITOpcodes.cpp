@@ -1393,8 +1393,10 @@ void JIT::emit_op_enter(const JSInstruction*)
             store32(argumentGPR2, Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfJITExecuteCounter()));
         }
     }
-    if (TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_profiledCodeBlock)) [[unlikely]]
+    if (TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_profiledCodeBlock)) [[unlikely]] {
         add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanWork()));
+        add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanCalls()));
+    }
 #endif
 }
 
@@ -1612,7 +1614,7 @@ void JIT::emit_op_loop_hint(const JSInstruction* instruction)
     }
 
 #if ENABLE(DFG_JIT)
-    if (TierUpExperts::workCountingLoops() && TierUpExperts::isWorkCounted(m_profiledCodeBlock)) [[unlikely]]
+    if (TierUpExperts::workCountingLoops() && (Options::tierUpExpertsLoopCounterTiers() & 1) && TierUpExperts::isWorkCounted(m_profiledCodeBlock)) [[unlikely]]
         add64(TrustedImm32(1), Address(GPRInfo::jitDataRegister, BaselineJITData::offsetOfMinutemanWork()));
 #endif
     // Emit the JIT optimization check: 

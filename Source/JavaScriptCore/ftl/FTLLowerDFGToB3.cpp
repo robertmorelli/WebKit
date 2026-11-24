@@ -41,6 +41,8 @@
 #include "BaselineJITCode.h"
 #include "BaselineJITRegisters.h"
 #include "B3ValueInlines.h"
+#include "B3Variable.h"
+#include "B3VariableValue.h"
 #include "ButterflyInlines.h"
 #include "CPUInlines.h"
 #include "CallFrameShuffler.h"
@@ -253,8 +255,10 @@ public:
                     jit.emitFunctionPrologue();
 
                     AllowMacroScratchRegisterUsage allowScratch(jit);
-                    if (minutemanWork)
+                    if (minutemanWork) {
                         jit.add64(CCallHelpers::TrustedImm32(1), CCallHelpers::AbsoluteAddress(minutemanWork));
+                        jit.add64(CCallHelpers::TrustedImm32(1), CCallHelpers::AbsoluteAddress(minutemanWork + 1)); // calls (D35)
+                    }
 
                     // Stack overflow check before frame allocation.
                     // At this point SP == FP; no callee-saves have been saved.
@@ -312,6 +316,12 @@ public:
         m_out.appendTo(prologue, hasMultipleEntrypoints ? callEntrypointArgumentSpeculations : m_handleExceptions);
         m_out.initializeConstants(m_proc, prologue);
         createPhiVariables();
+        // minuteman (D33): FTL loop back-edges counted in a B3 variable (a register in the loop),
+        // flushed to the work counter at returns, tail calls and every 1024 back-edges.
+        if (m_minutemanWork && TierUpExperts::workCountingLoops() && (Options::tierUpExpertsLoopCounterTiers() & 4)) [[unlikely]] {
+            m_minutemanLoopVar = m_proc.addVariable(B3::Int64);
+            m_out.m_block->appendNew<B3::VariableValue>(m_proc, B3::Set, m_out.origin(), m_minutemanLoopVar, m_out.constInt64(0));
+        }
 
         uint64_t sizeOfCaptured = sizeof(JSValue) * m_graph.m_nextMachineLocal;
         B3::SlotBaseValue* capturedBase = m_out.lockedStackSlot(sizeOfCaptured);
@@ -758,6 +768,18 @@ private:
         }
 
         CodeGenerationResult codeGenerationResult = CodeGenerationResult::Generated;
+        if (m_minutemanLoopVar) [[unlikely]] {
+            switch (m_node->op()) {
+            case TailCall:
+            case DirectTailCall:
+            case TailCallVarargs:
+            case TailCallForwardVarargs:
+                flushMinutemanLoopCount(); // the frame is left without a Return
+                break;
+            default:
+                break;
+            }
+        }
         switch (m_node->op()) {
         case DFG::Upsilon:
             compileUpsilon();
@@ -16154,9 +16176,21 @@ IGNORE_CLANG_WARNINGS_END
         m_out.entrySwitch(successors);
     }
 
+    // minuteman (D33): add the register-carried FTL loop count to the work counter and reset it.
+    void flushMinutemanLoopCount()
+    {
+        if (!m_minutemanLoopVar)
+            return;
+        LValue count = m_out.m_block->appendNew<B3::VariableValue>(m_proc, B3::Get, m_out.origin(), m_minutemanLoopVar);
+        m_out.store64(m_out.add(m_out.load64(m_out.absolute(m_minutemanWork)), count), m_out.absolute(m_minutemanWork));
+        m_out.m_block->appendNew<B3::VariableValue>(m_proc, B3::Set, m_out.origin(), m_minutemanLoopVar, m_out.constInt64(0));
+    }
+
     void compileReturn()
     {
-        m_out.ret(lowJSValue(m_node->child1()));
+        LValue result = lowJSValue(m_node->child1());
+        flushMinutemanLoopCount();
+        m_out.ret(result);
     }
 
     void compileForceOSRExit()
@@ -23086,8 +23120,19 @@ IGNORE_CLANG_WARNINGS_END
 
     void compileLoopHint()
     {
-        if (m_minutemanWork && TierUpExperts::workCountingLoops()) [[unlikely]]
-            m_out.store64(m_out.add(m_out.load64(m_out.absolute(m_minutemanWork)), m_out.constInt64(1)), m_out.absolute(m_minutemanWork));
+        if (m_minutemanLoopVar) [[unlikely]] {
+            LValue count = m_out.add(m_out.m_block->appendNew<B3::VariableValue>(m_proc, B3::Get, m_out.origin(), m_minutemanLoopVar), m_out.constInt64(1));
+            m_out.m_block->appendNew<B3::VariableValue>(m_proc, B3::Set, m_out.origin(), m_minutemanLoopVar, count);
+            if (Options::tierUpExpertsFTLNoInLoopFlush()) // diagnostic (D34): flush only at returns / tail calls
+                return;
+            LBasicBlock flush = m_out.newBlock();
+            LBasicBlock continuation = m_out.newBlock();
+            m_out.branch(m_out.testIsZero64(count, m_out.constInt64(1023)), rarely(flush), usually(continuation));
+            LBasicBlock lastNext = m_out.appendTo(flush, continuation);
+            flushMinutemanLoopCount();
+            m_out.jump(continuation);
+            m_out.appendTo(continuation, lastNext);
+        }
         if (!Options::returnEarlyFromInfiniteLoopsForFuzzing()) [[likely]]
             return;
 
@@ -28516,6 +28561,7 @@ IGNORE_CLANG_WARNINGS_END
     Graph& m_graph;
     // minuteman (tools/TierUpExperts): this compile's work counter (calls + loop back-edges),
     // when the ghost machinery is on.
+    B3::Variable* m_minutemanLoopVar { nullptr };
     uint64_t* m_minutemanWork { TierUpExperts::workCounting() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock) ? TierUpExperts::workCounterFor(m_graph.m_codeBlock, true) : nullptr };
     State& m_ftlState;
     Procedure& m_proc;

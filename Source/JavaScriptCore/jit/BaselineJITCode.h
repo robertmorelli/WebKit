@@ -156,11 +156,15 @@ public:
     // counted only when the ghost machinery is on (a work unit comparable across tiers).
     static constexpr ptrdiff_t offsetOfMinutemanWork() { return OBJECT_OFFSETOF(BaselineJITData, m_minutemanWork); }
     uint64_t minutemanWork() const { return m_minutemanWork; }
+    // calls alone (D35: work per call, to estimate FTL work without FTL loop counters)
+    static constexpr ptrdiff_t offsetOfMinutemanCalls() { return OBJECT_OFFSETOF(BaselineJITData, m_minutemanCalls); }
+    uint64_t minutemanCalls() const { return m_minutemanCalls; }
 
     JSGlobalObject* m_globalObject { nullptr }; // This is not marked since owner CodeBlock will mark JSGlobalObject.
     intptr_t m_stackOffset { 0 };
     BaselineExecutionCounter m_executeCounter;
     uint64_t m_minutemanWork { 0 };
+    uint64_t m_minutemanCalls { 0 };
 };
 
 } // namespace JSC

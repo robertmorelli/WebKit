@@ -2021,7 +2021,7 @@ void SpeculativeJIT::noticeOSRBirth(Node* node)
 
 void SpeculativeJIT::compileLoopHint(Node* node)
 {
-    if (TierUpExperts::workCountingLoops() && TierUpExperts::isWorkCounted(m_graph.m_codeBlock)) [[unlikely]]
+    if (TierUpExperts::workCountingLoops() && (Options::tierUpExpertsLoopCounterTiers() & 2) && TierUpExperts::isWorkCounted(m_graph.m_codeBlock)) [[unlikely]]
         add64(TrustedImm32(1), AbsoluteAddress(TierUpExperts::workCounterFor(m_graph.m_codeBlock, false)));
     if (Options::returnEarlyFromInfiniteLoopsForFuzzing()) [[unlikely]] {
         bool emitEarlyReturn = true;

@@ -151,6 +151,7 @@ struct FnState { // per baseline CodeBlock
     uint32_t probeExits { 0 };
     double sampleMs[3] { };             // this function's sampled ms in Baseline / DFG / FTL
     uint64_t retiredWork[2] { 0, 0 };   // work of destroyed DFG / FTL code for this function
+    uint64_t retiredCalls[2] { 0, 0 };  // calls of destroyed DFG / FTL code (D35)
     HashSet<CodeBlock*> liveOptimized;  // optimized CodeBlocks with a work counter
     int8_t functionClass { -1 };
     Vector<CodeBlock*> inlinees;    // inlined by this function's most recent optimized compile
@@ -171,7 +172,7 @@ struct OptState { // per optimized CodeBlock
     bool causeSplitRearm { false };
     HashMap<unsigned, uint64_t> transientTickPlusOne; // code origin hash -> tick + 1
     // work counter (calls + loop back-edges) of this optimized code; tier 0 DFG, 1 FTL
-    std::unique_ptr<uint64_t> work;
+    std::unique_ptr<uint64_t[]> work; // [0] work (calls + counted back-edges), [1] calls
     unsigned workTier { 0 };
     CodeBlock* workBaseline { nullptr };
     // cause-split persistent site, handed to the baseline on jettison
@@ -401,19 +402,35 @@ std::optional<double> gapMedian() WTF_REQUIRES_LOCK(s_lock)
     return s_gapLow->top();
 }
 
-uint64_t workOf(CodeBlock* baseline, FnState& st, unsigned tierIndex) WTF_REQUIRES_LOCK(s_lock)
+// Counted work (calls == false) or calls (calls == true) of the function in tier 0 Baseline,
+// 1 DFG, 2 FTL.
+uint64_t countedOf(CodeBlock* baseline, FnState& st, unsigned tierIndex, bool calls) WTF_REQUIRES_LOCK(s_lock)
 {
     if (!tierIndex) {
         auto* jitData = baseline->baselineJITData();
-        return jitData ? jitData->minutemanWork() : 0;
+        return jitData ? (calls ? jitData->minutemanCalls() : jitData->minutemanWork()) : 0;
     }
-    uint64_t w = st.retiredWork[tierIndex - 1];
+    uint64_t w = calls ? st.retiredCalls[tierIndex - 1] : st.retiredWork[tierIndex - 1];
     for (CodeBlock* optimized : st.liveOptimized) {
         auto it = s_opt->find(optimized);
         if (it != s_opt->end() && it->value->work && it->value->workTier == tierIndex - 1)
-            w += *it->value->work;
+            w += it->value->work[calls ? 1 : 0];
     }
     return w;
+}
+
+// Work in tier `tierIndex`. Without FTL back-edge counters (D35), FTL work is estimated as FTL
+// calls x the function's Baseline + DFG work per call (0, i.e. unknown, without both).
+uint64_t workOf(CodeBlock* baseline, FnState& st, unsigned tierIndex) WTF_REQUIRES_LOCK(s_lock)
+{
+    if (tierIndex < 2 || (Options::tierUpExpertsLoopCounterTiers() & 4))
+        return countedOf(baseline, st, tierIndex, false);
+    uint64_t ftlCalls = countedOf(baseline, st, 2, true);
+    uint64_t lowerCalls = countedOf(baseline, st, 0, true) + countedOf(baseline, st, 1, true);
+    uint64_t lowerWork = countedOf(baseline, st, 0, false) + countedOf(baseline, st, 1, false);
+    if (!ftlCalls || !lowerCalls)
+        return 0;
+    return static_cast<uint64_t>(static_cast<double>(ftlCalls) * lowerWork / lowerCalls);
 }
 
 Record makeRecord(CodeBlock* baseline, FnState& st) WTF_REQUIRES_LOCK(s_lock)
@@ -746,6 +763,14 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
 
 void dump()
 {
+    if (Options::tierUpExpertsDumpWork()) {
+        Locker locker { s_lock };
+        for (auto& [function, st] : *s_fn) {
+            uint64_t w[3] = { workOf(function, *st, 0), workOf(function, *st, 1), workOf(function, *st, 2) };
+            if (w[0] + w[1] + w[2])
+                dataLogLn("tierUpExperts: work fn=", function->inferredName(), " baseline=", w[0], " dfg=", w[1], " ftl=", w[2]);
+        }
+    }
     if (s_dumped || !g_enabled || !Options::verboseTierUpExperts())
         return;
     s_dumped = true;
@@ -989,6 +1014,17 @@ void initialize(VM& vm)
         }
         RELEASE_ASSERT_WITH_MESSAGE(known, "tierUpExperts: unknown --tierUpMixerIncumbent");
     }
+    if (Options::tierUpMixerPrior()) {
+        // D36: newcomers (mix experts other than jsc-default and the incumbent) start at
+        // log-weight -ln(n) each, so together they weigh as much as one incumbent.
+        unsigned newcomers = 0;
+        for (unsigned e = 1; e < NumTierExperts; ++e)
+            newcomers += (s_mix & (1 << e)) && e != s_incumbent;
+        for (unsigned e = 1; e < NumTierExperts; ++e) {
+            if ((s_mix & (1 << e)) && e != s_incumbent && newcomers)
+                s_logGlobal[e] = -std::log(static_cast<double>(newcomers));
+        }
+    }
     s_weightedMajority = rule == "weighted-majority"_s;
     g_deoptEnabled = !!d;
     found = !d;
@@ -1053,7 +1089,8 @@ void forget(CodeBlock* codeBlock)
         OptState& os = *o->value;
         if (os.work) {
             if (FnState* b = findFnState(os.workBaseline)) {
-                b->retiredWork[os.workTier] += *os.work;
+                b->retiredWork[os.workTier] += os.work[0];
+                b->retiredCalls[os.workTier] += os.work[1];
                 b->liveOptimized.remove(codeBlock);
             }
         }
@@ -1849,7 +1886,7 @@ uint64_t* workCounterFor(CodeBlock* machine, bool ftl)
     Locker locker { s_lock };
     OptState& os = optState(machine);
     if (!os.work) {
-        os.work = std::make_unique<uint64_t>(0);
+        os.work = std::unique_ptr<uint64_t[]>(new uint64_t[2] { 0, 0 });
         os.workTier = ftl ? 1 : 0;
         os.workBaseline = baseline;
         fnState(baseline).liveOptimized.add(machine);
