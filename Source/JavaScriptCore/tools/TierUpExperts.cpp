@@ -239,6 +239,8 @@ struct OrderStats {
     uint64_t candidates { 0 }, candLoop { 0 }, candLive { 0 }, firstLive { 0 }; // inputs seen, lowest tier
 };
 OrderStats s_order;
+struct DequeueRecord { unsigned tier; uint64_t arrival; unsigned hash; };
+Vector<DequeueRecord>* s_dequeueOrder;
 HashMap<CodeBlock*, std::unique_ptr<OptState>>* s_opt;
 Stats s_stats;
 Vector<Record>* s_retired;
@@ -832,6 +834,10 @@ void dump()
             dataLogLn("tierUpExperts: order expert=", kOrderNames[e], " computed=", s_order.dps, " differsFromFifo=", s_order.differsFromFifo[e],
                 " agreesWithActed=", s_order.agreesWithActed[e], " pickedOtherTier=", s_order.pickedOtherTier[e]);
     }
+    if (g_orderEnabled && Options::tierUpOrderLogSequence()) {
+        for (auto& r : *s_dequeueOrder)
+            dataLogLn("tierUpExperts: oseq ", r.tier, " ", r.arrival, " ", r.hash);
+    }
     if (Options::tierUpExpertsQueueContention()) {
         double wallMs = (MonotonicTime::now() - s_vmStart).milliseconds();
         for (unsigned s = 0; s < 2; ++s) {
@@ -1112,6 +1118,7 @@ void initialize(VM& vm)
         s_callOut = new HashMap<CodeBlock*, HashSet<CodeBlock*>>();
         s_callIn = new HashMap<CodeBlock*, HashSet<CodeBlock*>>();
         s_rank = new HashMap<CodeBlock*, double>();
+        s_dequeueOrder = new Vector<DequeueRecord>();
         g_orderEnabled = true;
     }
     g_enabled = true;
@@ -2111,6 +2118,12 @@ unsigned orderPick(const Vector<OrderCandidate, 16>& c)
         s_order.pickedOtherTier[e] += pick[e] >= end;
     }
     return acted;
+}
+
+void noteDequeueOrder(unsigned tier, uint64_t arrival, unsigned hash)
+{
+    Locker locker { s_lock };
+    s_dequeueOrder->append({ tier, arrival, hash });
 }
 
 void tick()

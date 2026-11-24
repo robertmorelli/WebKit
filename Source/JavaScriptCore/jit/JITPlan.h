@@ -151,6 +151,8 @@ public:
     const BaselineExecutionCounter* m_minutemanLowerCounter { nullptr };
     const UpperTierExecutionCounter* m_minutemanUpperCounter { nullptr };
     double m_minutemanCountAtEnqueue { 0 };
+    uint64_t m_minutemanArrival { 0 }; // D50: enqueue number (all tiers)
+    unsigned m_minutemanHash { 0 };    // D50: CodeBlock hash (stable across runs)
 protected:
     VM* m_vm;
     CodeBlock* m_codeBlock;

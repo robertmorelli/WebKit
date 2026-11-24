@@ -309,6 +309,10 @@ CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
                 break;
             }
             plan->m_minutemanCountAtEnqueue = minutemanCount(plan.get());
+            static uint64_t s_arrivals; // worklist lock held
+            plan->m_minutemanArrival = ++s_arrivals;
+            if (Options::tierUpOrderLogSequence())
+                plan->m_minutemanHash = plan->codeBlock()->hash().hash();
         }
     }
     m_queues[tier].append(WTF::move(plan));
@@ -377,6 +381,8 @@ bool JITWorklist::dequeuePlan(const AbstractLocker&, JITWorkerSlot& slot)
         if (!pickedTier)
             slot.m_plan = m_queues[i].takeFirst();
         RELEASE_ASSERT(slot.m_plan);
+        if (TierUpExperts::orderingEnabled() && Options::tierUpOrderLogSequence()) [[unlikely]]
+            TierUpExperts::noteDequeueOrder(i, slot.m_plan->m_minutemanArrival, slot.m_plan->m_minutemanHash);
         if (TierUpExperts::enabled()) [[unlikely]] {
             double waitMs = (MonotonicTime::now() - slot.m_plan->m_minutemanEnqueued).milliseconds();
             TierUpExperts::noteQueueWait(i, waitMs, slot.m_plan->m_minutemanAhead, m_queues[i].size());

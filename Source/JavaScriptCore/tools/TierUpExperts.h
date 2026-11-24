@@ -191,6 +191,8 @@ struct OrderCandidate {
 unsigned orderPick(const Vector<OrderCandidate, 16>&);
 // Sampler thread, every interval: recomputes the call graph's PageRank when due.
 void tick();
+// D50: one dequeue, in order (worklist lock held).
+void noteDequeueOrder(unsigned tier, uint64_t arrival, unsigned hash);
 
 } // namespace TierUpExperts
 } // namespace JSC

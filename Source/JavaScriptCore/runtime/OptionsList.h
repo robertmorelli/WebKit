@@ -165,6 +165,7 @@ bool hasCapacityToUseLargeGigacage();
     v(Unsigned, tierUpTimeAttributionIntervalUs, 1000, Normal, "minuteman: time attribution sampling interval (us)"_s) \
     v(Bool, tierUpTimeAttributionSelfSampling, false, Normal, "minuteman: sample with a per-thread CPU-time SIGPROF timer delivered to the JS thread (lock-free ring, no suspend/resume) instead of suspending it; Linux x86_64 only"_s) \
     v(Bool, verboseTierUpTimeAttribution, false, Normal, "minuteman: print time attribution summary at exit"_s) \
+    v(Bool, tierUpOrderLogSequence, false, Normal, "minuteman D50: with --verboseTierUpExperts, print every dequeue (tier, arrival number, CodeBlock hash) at exit, for compile-order edit distances."_s) \
     v(OptionString, tierUpOrderExpert, nullptr, Normal, "minuteman D49: compile-queue ordering expert acting: fifo, newest, loop-bound, smallest, caller-first, global-arrival, live-first, pagerank (tools/TierUpExperts.h). Every ordering expert computes its pick at every dequeue with >= 2 dequeueable plans. Needs --tierUpExpert. Off by default."_s) \
     v(OptionString, tierUpExpert, nullptr, Normal, "minuteman: DFG/FTL tier-up expert: jsc-default, cost-benefit, stability-gate, caller-triggered, inline-aware, mixer (see tools/TierUpExperts.h). Off by default."_s) \
     v(Bool, tierUpExpertsWorkCountersCallsOnly, false, Normal, "minuteman: work counters count calls only, not loop back-edges (overhead measurement only)"_s) \
