@@ -6732,6 +6732,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerTierUpNow, void, (VM* vmPointe
     JITCode* jitCode = codeBlock->jitCode()->dfg();
     
     dataLogLnIf(Options::verboseOSR(), *codeBlock, ": Entered triggerTierUpNow with executeCounter = ", codeBlock->dfgJITData()->tierUpCounter());
+    TierUpExperts::CounterVisitScope minutemanVisit(codeBlock->baselineAlternative(), TierUpExperts::DFGTierUpCounter, codeBlock->dfgJITData()->tierUpCounter()); // D51
 
     if (shouldTriggerFTLCompile(codeBlock, jitCode, false))
         triggerFTLReplacementCompile(vm, codeBlock, jitCode);
@@ -7000,6 +7001,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerTierUpNowInLoop, void, (VM* vm
     JITCode* jitCode = codeBlock->jitCode()->dfg();
 
     dataLogLnIf(Options::verboseOSR(), *codeBlock, ": Entered triggerTierUpNowInLoop with executeCounter = ", codeBlock->dfgJITData()->tierUpCounter());
+    TierUpExperts::CounterVisitScope minutemanVisit(codeBlock->baselineAlternative(), TierUpExperts::DFGTierUpCounter, codeBlock->dfgJITData()->tierUpCounter()); // D51
 
     if (jitCode->tierUpInLoopHierarchy.contains(bytecodeIndex))
         tierUpCommon(vm, callFrame, bytecodeIndex, false);
@@ -7030,6 +7032,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationTriggerOSREntryNow, char*, (VM* vmPoi
     }
 
     dataLogLnIf(Options::verboseOSR(), *codeBlock, ": Entered triggerOSREntryNow with executeCounter = ", codeBlock->dfgJITData()->tierUpCounter());
+    TierUpExperts::CounterVisitScope minutemanVisit(codeBlock->baselineAlternative(), TierUpExperts::DFGTierUpCounter, codeBlock->dfgJITData()->tierUpCounter()); // D51
 
     return tierUpCommon(vm, callFrame, bytecodeIndex, true);
 }

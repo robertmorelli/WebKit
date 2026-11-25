@@ -2896,6 +2896,7 @@ JSC_DEFINE_JIT_OPERATION(operationOptimize, UGPRPair, (VM* vmPointer, uint32_t b
         dataLog("Unexpected code block in Baseline->DFG tier-up: ", *codeBlock, "\n");
         RELEASE_ASSERT_NOT_REACHED();
     }
+    TierUpExperts::CounterVisitScope minutemanVisit(codeBlock, TierUpExperts::BaselineCounter, codeBlock->baselineExecuteCounter()); // D51
 
     DFG::CapabilityLevel level = codeBlock->capabilityLevel();
     if (level == DFG::CannotCompile)

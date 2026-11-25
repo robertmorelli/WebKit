@@ -194,5 +194,42 @@ void tick();
 // D50: one dequeue, in order (worklist lock held).
 void noteDequeueOrder(unsigned tier, uint64_t arrival, unsigned hash);
 
+// ---- D51 shadow queues (--tierUpOrderShadow). Every ordering expert keeps its own copy of the
+// compile queue: same arrivals (shadowEnqueue), same service opportunities (each real dequeue is
+// one, shadowDequeue), compile time = size x this run's measured ms per bytecode for the tier
+// (shadowReady feeds it). Regret of expert e on a plan = executions of the plan's function from
+// arrival until e's shadow would have finished it: the lower tier's counter, then (after the real
+// install) the next tier's counter (none for FTL code). Executions come from JSC's counter
+// slow-path visits (CounterVisitScope). All shadow calls except the visits hold the worklist lock.
+extern bool g_shadowEnabled;
+inline bool shadowEnabled() { return g_shadowEnabled; }
+enum CounterKind : unsigned { LLIntCounter = 0, BaselineCounter = 1, DFGTierUpCounter = 2, NoCounter = 3 };
+void shadowEnqueue(uint64_t id, unsigned tier, MonotonicTime arrival, unsigned size, bool loopEntry, CodeBlock* baseline, double countAtEnqueue);
+void shadowDequeue(uint64_t id, const unsigned limits[3]);
+void shadowReady(uint64_t id);
+void noteCounterVisit(CodeBlock* baseline, unsigned kind, double count, bool entry);
+template<typename Counter>
+class CounterVisitScope {
+public:
+    CounterVisitScope(CodeBlock* baseline, unsigned kind, const Counter& counter)
+        : m_baseline(baseline), m_kind(kind), m_counter(counter)
+    {
+        if (shadowEnabled()) [[unlikely]] {
+            m_on = true;
+            noteCounterVisit(m_baseline, m_kind, m_counter.count(), true);
+        }
+    }
+    ~CounterVisitScope()
+    {
+        if (m_on) [[unlikely]]
+            noteCounterVisit(m_baseline, m_kind, m_counter.count(), false);
+    }
+private:
+    CodeBlock* m_baseline;
+    unsigned m_kind;
+    const Counter& m_counter;
+    bool m_on { false };
+};
+
 } // namespace TierUpExperts
 } // namespace JSC

@@ -313,6 +313,8 @@ CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
             plan->m_minutemanArrival = ++s_arrivals;
             if (Options::tierUpOrderLogSequence())
                 plan->m_minutemanHash = plan->codeBlock()->hash().hash();
+            if (TierUpExperts::shadowEnabled())
+                TierUpExperts::shadowEnqueue(plan->m_minutemanArrival, tier, plan->m_minutemanEnqueued, plan->m_minutemanSize, loopEntry, plan->m_minutemanBaseline, plan->m_minutemanCountAtEnqueue);
         }
     }
     m_queues[tier].append(WTF::move(plan));
@@ -383,6 +385,12 @@ bool JITWorklist::dequeuePlan(const AbstractLocker&, JITWorkerSlot& slot)
         RELEASE_ASSERT(slot.m_plan);
         if (TierUpExperts::orderingEnabled() && Options::tierUpOrderLogSequence()) [[unlikely]]
             TierUpExperts::noteDequeueOrder(i, slot.m_plan->m_minutemanArrival, slot.m_plan->m_minutemanHash);
+        if (TierUpExperts::shadowEnabled()) [[unlikely]] {
+            unsigned limits[3];
+            for (unsigned t = 0; t < 3; ++t)
+                limits[t] = maximumNumberOfConcurrentCompilations(t);
+            TierUpExperts::shadowDequeue(slot.m_plan->m_minutemanArrival, limits);
+        }
         if (TierUpExperts::enabled()) [[unlikely]] {
             double waitMs = (MonotonicTime::now() - slot.m_plan->m_minutemanEnqueued).milliseconds();
             TierUpExperts::noteQueueWait(i, waitMs, slot.m_plan->m_minutemanAhead, m_queues[i].size());
@@ -432,6 +440,8 @@ void JITWorklist::compileOnSlot(JITWorkerSlot& slot)
             return;
 
         slot.m_plan->notifyReady();
+        if (TierUpExperts::shadowEnabled()) [[unlikely]]
+            TierUpExperts::shadowReady(slot.m_plan->m_minutemanArrival);
 
         if (Options::verboseCompilationQueue()) {
             dump(locker, WTF::dataFile());

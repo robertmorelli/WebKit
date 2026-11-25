@@ -398,6 +398,7 @@ static inline bool shouldJIT(CodeBlock* codeBlock)
 static inline bool jitCompileAndSetHeuristics(VM& vm, CodeBlock* codeBlock)
 {
     DeferGCForAWhile deferGC(vm); // My callers don't set top callframe, so we don't want to GC here at all.
+    TierUpExperts::CounterVisitScope minutemanVisit(codeBlock, TierUpExperts::LLIntCounter, codeBlock->llintExecuteCounter()); // D51
     ASSERT(Options::useJIT());
 
     auto installSharedBaselineCode = [&] {

@@ -48,6 +48,7 @@ namespace TierUpExperts {
 
 bool g_enabled { false };
 bool g_orderEnabled { false };
+bool g_shadowEnabled { false };
 bool g_deoptEnabled { false };
 
 namespace {
@@ -241,6 +242,55 @@ struct OrderStats {
 OrderStats s_order;
 struct DequeueRecord { unsigned tier; uint64_t arrival; unsigned hash; };
 Vector<DequeueRecord>* s_dequeueOrder;
+// ---- D51 shadow queues (notes/decisions.md D51).
+namespace {
+struct ShadowRecord {
+    uint64_t id;
+    unsigned tier;
+    MonotonicTime arrival;
+    unsigned size;
+    bool loopEntry;
+    CodeBlock* baseline; // key only; nulled when forgotten
+    unsigned watch[2]; // CounterKind before / after the real install
+    double skip[2] { 0, 0 }; // executions already on a shared watch before this plan arrived
+    bool started[NumOrderExperts] { };
+    MonotonicTime start[NumOrderExperts];
+    bool realStarted { false }, ready { false };
+    MonotonicTime realStart, realReady;
+    double cum { 0 };
+    Vector<std::pair<MonotonicTime, double>> exec; // (visit time, executions since arrival)
+};
+struct Watch {
+    double lastExit;
+    Vector<uint64_t> records;
+};
+struct Shadow {
+    Vector<uint64_t> queue[3]; // arrival order
+    Vector<uint64_t> running;
+    uint64_t banked { 0 };
+};
+struct ShadowStats {
+    uint64_t enqueued { 0 }, opportunities { 0 }, scored { 0 }, censored { 0 };
+    uint64_t picks[NumOrderExperts] { }; // shadow decision points where expert e computed its pick
+    uint64_t lostOpportunities[NumOrderExperts] { }; // banked opportunities never spent by run end
+    double regret[NumOrderExperts] { };
+    double regretByTier[NumOrderExperts][3] { };
+    uint64_t calibrated { 0 }, within20 { 0 };
+    double sumAbsRelErr { 0 };
+    uint64_t visits { 0 }, credited { 0 };
+};
+}
+HashMap<uint64_t, std::unique_ptr<ShadowRecord>>* s_shadowRecords;
+HashMap<uintptr_t, Watch>* s_watches;
+Shadow s_shadows[NumOrderExperts];
+double s_compileMs[3] { }, s_compileSize[3] { };
+unsigned s_shadowLimits[3] { 1, 1, 1 };
+ShadowStats s_shadowStats;
+
+static void unwatch(ShadowRecord&);
+static uintptr_t watchKey(CodeBlock* baseline, unsigned kind);
+static void scoreShadows(MonotonicTime now, bool final);
+static double msPerBytecode(unsigned tier);
 HashMap<CodeBlock*, std::unique_ptr<OptState>>* s_opt;
 Stats s_stats;
 Vector<Record>* s_retired;
@@ -834,6 +884,16 @@ void dump()
             dataLogLn("tierUpExperts: order expert=", kOrderNames[e], " computed=", s_order.dps, " differsFromFifo=", s_order.differsFromFifo[e],
                 " agreesWithActed=", s_order.agreesWithActed[e], " pickedOtherTier=", s_order.pickedOtherTier[e]);
     }
+    if (g_shadowEnabled) {
+        scoreShadows(MonotonicTime::now(), true);
+        auto& st = s_shadowStats;
+        dataLogLn("tierUpExperts: shadow enqueued=", st.enqueued, " opportunities=", st.opportunities, " scored=", st.scored, " censored=", st.censored,
+            " calibrated=", st.calibrated, " within20=", st.within20, " meanAbsRelErr=", st.calibrated ? st.sumAbsRelErr / st.calibrated : 0,
+            " msPerBytecode=", msPerBytecode(0), "/", msPerBytecode(1), "/", msPerBytecode(2), " visits=", st.visits, " credited=", st.credited);
+        for (unsigned e = 0; e < NumOrderExperts; ++e)
+            dataLogLn("tierUpExperts: shadow expert=", kOrderNames[e], " picks=", st.picks[e], " banked=", s_shadows[e].banked, " regret=", st.regret[e],
+                " byTier=", st.regretByTier[e][0], "/", st.regretByTier[e][1], "/", st.regretByTier[e][2]);
+    }
     if (g_orderEnabled && Options::tierUpOrderLogSequence()) {
         for (auto& r : *s_dequeueOrder)
             dataLogLn("tierUpExperts: oseq ", r.tier, " ", r.arrival, " ", r.hash);
@@ -1120,6 +1180,11 @@ void initialize(VM& vm)
         s_rank = new HashMap<CodeBlock*, double>();
         s_dequeueOrder = new Vector<DequeueRecord>();
         g_orderEnabled = true;
+        if (Options::tierUpOrderShadow()) {
+            s_shadowRecords = new HashMap<uint64_t, std::unique_ptr<ShadowRecord>>();
+            s_watches = new HashMap<uintptr_t, Watch>();
+            g_shadowEnabled = true;
+        }
     }
     g_enabled = true;
     if (Options::verboseTierUpExperts())
@@ -1153,6 +1218,21 @@ void forget(CodeBlock* codeBlock)
             s_graphVersion++;
         }
         s_rank->remove(codeBlock);
+        if (g_shadowEnabled) {
+            for (unsigned kind = 0; kind < NoCounter; ++kind) {
+                auto w = s_watches->find(watchKey(codeBlock, kind));
+                if (w == s_watches->end())
+                    continue;
+                Vector<uint64_t> ids = WTF::move(w->value.records);
+                s_watches->remove(w);
+                for (uint64_t id : ids) {
+                    if (auto r = s_shadowRecords->find(id); r != s_shadowRecords->end()) {
+                        unwatch(*r->value);
+                        r->value->baseline = nullptr;
+                    }
+                }
+            }
+        }
     }
     if (auto e = s_edges->find(codeBlock); e != s_edges->end()) {
         EdgeState& es = *e->value;
@@ -2046,14 +2126,13 @@ void noteSample(CodeBlock* root, unsigned tier)
     }
 }
 
-unsigned orderPick(const Vector<OrderCandidate, 16>& c)
+// Every ordering expert's pick from c (s_lock held). Returns end of the lowest dequeueable tier.
+static unsigned computeOrderPicks(const Vector<OrderCandidate, 16>& c, unsigned pick[NumOrderExperts])
 {
     // c is in tier order: [0, end) is the lowest dequeueable tier, which JSC serves first.
     unsigned end = 1;
     while (end < c.size() && c[end].tier == c[0].tier)
         ++end;
-    unsigned pick[NumOrderExperts];
-    Locker locker { s_lock };
     pick[OFifo] = 0;
     pick[ONewest] = end - 1;
     pick[OLoopBound] = 0;
@@ -2102,6 +2181,14 @@ unsigned orderPick(const Vector<OrderCandidate, 16>& c)
             pick[OPageRank] = i;
         }
     }
+    return end;
+}
+
+unsigned orderPick(const Vector<OrderCandidate, 16>& c)
+{
+    unsigned pick[NumOrderExperts];
+    Locker locker { s_lock };
+    unsigned end = computeOrderPicks(c, pick);
     unsigned acted = pick[s_orderSelected];
     for (unsigned i = 0; i < end; ++i) {
         bool live = c[i].ranSinceEnqueue;
@@ -2120,6 +2207,242 @@ unsigned orderPick(const Vector<OrderCandidate, 16>& c)
     return acted;
 }
 
+
+namespace {
+static uintptr_t watchKey(CodeBlock* baseline, unsigned kind) { return reinterpret_cast<uintptr_t>(baseline) | kind; }
+static double msPerBytecode(unsigned tier) { return s_compileSize[tier] ? s_compileMs[tier] / s_compileSize[tier] : 0; }
+static MonotonicTime shadowFinish(const ShadowRecord& r, unsigned e)
+{
+    return r.start[e] + Seconds::fromMilliseconds(r.size * msPerBytecode(r.tier));
+}
+static double execUpTo(const ShadowRecord& r, MonotonicTime t)
+{
+    // exec is in time order; the cumulative count at the last visit at or before t.
+    size_t lo = 0, hi = r.exec.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (r.exec[mid].first <= t)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo ? r.exec[lo - 1].second : 0;
+}
+
+// Spend each shadow's banked opportunities at `now` (s_lock held).
+static void runShadows(MonotonicTime now)
+{
+    for (unsigned e = 0; e < NumOrderExperts; ++e) {
+        Shadow& sh = s_shadows[e];
+        while (sh.banked) {
+            unsigned runningPerTier[3] = { 0, 0, 0 };
+            sh.running.removeAllMatching([&](uint64_t id) {
+                auto it = s_shadowRecords->find(id);
+                if (it == s_shadowRecords->end())
+                    return true;
+                if (shadowFinish(*it->value, e) <= now)
+                    return true;
+                runningPerTier[it->value->tier]++;
+                return false;
+            });
+            Vector<OrderCandidate, 16> c;
+            Vector<std::pair<unsigned, unsigned>, 16> where; // (tier, index in queue)
+            for (unsigned t = 0; t < 3; ++t) {
+                if (sh.queue[t].isEmpty() || runningPerTier[t] >= s_shadowLimits[t])
+                    continue;
+                for (unsigned i = 0; i < sh.queue[t].size(); ++i) {
+                    ShadowRecord& r = *s_shadowRecords->get(sh.queue[t][i]);
+                    c.append({ t, r.arrival, r.size, r.loopEntry, r.cum > 0, r.baseline });
+                    where.append({ t, i });
+                }
+            }
+            if (c.isEmpty())
+                break;
+            unsigned k = 0;
+            if (c.size() >= 2) {
+                unsigned pick[NumOrderExperts];
+                computeOrderPicks(c, pick);
+                k = pick[e];
+                s_shadowStats.picks[e]++;
+            }
+            auto [t, i] = where[k];
+            uint64_t id = sh.queue[t][i];
+            sh.queue[t].removeAt(i);
+            ShadowRecord& r = *s_shadowRecords->get(id);
+            r.started[e] = true;
+            r.start[e] = now;
+            sh.running.append(id);
+            sh.banked--;
+        }
+    }
+}
+
+static void unwatch(ShadowRecord& r)
+{
+    if (!r.baseline)
+        return;
+    for (unsigned kind : r.watch) {
+        if (kind == NoCounter)
+            continue;
+        auto it = s_watches->find(watchKey(r.baseline, kind));
+        if (it == s_watches->end())
+            continue;
+        it->value.records.removeFirst(r.id);
+        if (it->value.records.isEmpty())
+            s_watches->remove(it);
+    }
+}
+
+// Score every record whose outcome is complete: the real compile is ready and every shadow's
+// modelled finish has passed. At run end (`final`), score the rest censored at `now`.
+static void scoreShadows(MonotonicTime now, bool final)
+{
+    Vector<uint64_t> done;
+    for (auto& [id, rp] : *s_shadowRecords) {
+        ShadowRecord& r = *rp;
+        bool complete = r.ready;
+        for (unsigned e = 0; e < NumOrderExperts && complete; ++e)
+            complete = r.started[e] && shadowFinish(r, e) <= now;
+        if (!complete && !final)
+            continue;
+        for (unsigned e = 0; e < NumOrderExperts; ++e) {
+            MonotonicTime until = r.started[e] ? std::min(shadowFinish(r, e), now) : now;
+            double x = execUpTo(r, until);
+            s_shadowStats.regret[e] += x;
+            s_shadowStats.regretByTier[e][r.tier] += x;
+        }
+        if (r.ready && r.started[OFifo]) {
+            double realMs = (r.realReady - r.arrival).milliseconds();
+            double simMs = (shadowFinish(r, OFifo) - r.arrival).milliseconds();
+            if (realMs > 0) {
+                double rel = std::abs(simMs - realMs) / realMs;
+                s_shadowStats.calibrated++;
+                s_shadowStats.within20 += rel <= 0.2;
+                s_shadowStats.sumAbsRelErr += rel;
+            }
+        }
+        (complete ? s_shadowStats.scored : s_shadowStats.censored)++;
+        done.append(id);
+    }
+    for (uint64_t id : done) {
+        unwatch(*s_shadowRecords->get(id));
+        for (auto& sh : s_shadows) {
+            for (auto& q : sh.queue)
+                q.removeFirst(id);
+            sh.running.removeFirst(id);
+        }
+        s_shadowRecords->remove(id);
+    }
+}
+
+} // anonymous namespace
+
+void shadowEnqueue(uint64_t id, unsigned tier, MonotonicTime arrival, unsigned size, bool loopEntry, CodeBlock* baseline, double countAtEnqueue)
+{
+    Locker locker { s_lock };
+    auto r = std::make_unique<ShadowRecord>();
+    r->id = id;
+    r->tier = std::min(tier, 2u);
+    r->arrival = arrival;
+    r->size = size;
+    r->loopEntry = loopEntry;
+    r->baseline = baseline;
+    // Before the real install the function runs in the tier below the plan's; after it, in the
+    // plan's tier, whose own tier-up counter JSC reads (FTL has none).
+    static constexpr unsigned before[3] = { LLIntCounter, BaselineCounter, DFGTierUpCounter };
+    static constexpr unsigned after[3] = { BaselineCounter, DFGTierUpCounter, NoCounter };
+    r->watch[0] = before[r->tier];
+    r->watch[1] = after[r->tier];
+    if (baseline) {
+        for (unsigned w = 0; w < 2; ++w) {
+            if (r->watch[w] == NoCounter)
+                continue;
+            auto add = s_watches->add(watchKey(baseline, r->watch[w]), Watch { w ? 0 : countAtEnqueue, { } });
+            if (!add.isNewEntry && !w && countAtEnqueue >= add.iterator->value.lastExit)
+                r->skip[w] = countAtEnqueue - add.iterator->value.lastExit;
+            add.iterator->value.records.append(id);
+        }
+    }
+    s_shadowRecords->add(id, WTF::move(r));
+    for (auto& sh : s_shadows)
+        sh.queue[std::min(tier, 2u)].append(id);
+    s_shadowStats.enqueued++;
+    runShadows(arrival);
+}
+
+void shadowDequeue(uint64_t id, const unsigned limits[3])
+{
+    MonotonicTime now = MonotonicTime::now();
+    Locker locker { s_lock };
+    for (unsigned t = 0; t < 3; ++t)
+        s_shadowLimits[t] = limits[t];
+    if (auto it = s_shadowRecords->find(id); it != s_shadowRecords->end()) {
+        it->value->realStarted = true;
+        it->value->realStart = now;
+    }
+    s_shadowStats.opportunities++;
+    for (auto& sh : s_shadows)
+        sh.banked++;
+    runShadows(now);
+}
+
+void shadowReady(uint64_t id)
+{
+    MonotonicTime now = MonotonicTime::now();
+    Locker locker { s_lock };
+    auto it = s_shadowRecords->find(id);
+    if (it == s_shadowRecords->end() || !it->value->realStarted)
+        return;
+    ShadowRecord& r = *it->value;
+    r.ready = true;
+    r.realReady = now;
+    s_compileMs[r.tier] += (now - r.realStart).milliseconds();
+    s_compileSize[r.tier] += r.size;
+    runShadows(now);
+}
+
+void noteCounterVisit(CodeBlock* baseline, unsigned kind, double count, bool entry)
+{
+    MonotonicTime now = MonotonicTime::now();
+    Locker locker { s_lock };
+    auto it = s_watches->find(watchKey(baseline, kind));
+    if (it == s_watches->end())
+        return;
+    Watch& w = it->value;
+    if (!entry) {
+        w.lastExit = count;
+        return;
+    }
+    s_shadowStats.visits++;
+    // JSC's count() only grows between re-arms; a re-arm (setNewThreshold / deferIndefinitely)
+    // happens inside a slow path (read on exit) or at enqueue / install. A count below the last
+    // exit value means a re-arm happened since: the count is then the executions since it.
+    double delta = count >= w.lastExit ? count - w.lastExit : std::max(count, 0.0);
+    if (count < w.lastExit && w.lastExit < 0)
+        delta = count - w.lastExit; // still counting up from deferIndefinitely's INT32_MIN
+    w.lastExit = count;
+    if (delta <= 0)
+        return;
+    s_shadowStats.credited++;
+    for (uint64_t id : w.records) {
+        if (auto r = s_shadowRecords->find(id); r != s_shadowRecords->end()) {
+            ShadowRecord& rec = *r->value;
+            double d = delta;
+            for (unsigned i = 0; i < 2; ++i) {
+                if (rec.watch[i] == kind && rec.skip[i] > 0) {
+                    double used = std::min(rec.skip[i], d);
+                    rec.skip[i] -= used;
+                    d -= used;
+                }
+            }
+            if (d <= 0)
+                continue;
+            rec.cum += d;
+            rec.exec.append({ now, rec.cum });
+        }
+    }
+}
+
 void noteDequeueOrder(unsigned tier, uint64_t arrival, unsigned hash)
 {
     Locker locker { s_lock };
@@ -2130,6 +2453,10 @@ void tick()
 {
     if (!g_orderEnabled)
         return;
+    if (g_shadowEnabled) {
+        Locker locker { s_lock };
+        scoreShadows(MonotonicTime::now(), false);
+    }
     static MonotonicTime s_lastRank;
     static uint64_t s_rankedVersion { 0 };
     MonotonicTime start = MonotonicTime::now();
