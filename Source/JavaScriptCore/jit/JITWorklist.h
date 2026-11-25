@@ -107,6 +107,7 @@ private:
 
     bool canDequeueFromTier(unsigned tier) const;
     bool hasDequeueablePlan() const;
+    void minutemanNoteLiveQueue(); // m_lock held
     bool dequeuePlan(const AbstractLocker&, JITWorkerSlot&);
     void compileOnSlot(JITWorkerSlot&);
 

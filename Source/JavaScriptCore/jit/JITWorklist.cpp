@@ -243,6 +243,16 @@ static bool minutemanRanSinceEnqueue(const JITPlan& plan)
     return now != plan.m_minutemanCountAtEnqueue && now != 0 && now != static_cast<double>(std::numeric_limits<int32_t>::min());
 }
 
+void JITWorklist::minutemanNoteLiveQueue() WTF_IGNORES_THREAD_SAFETY_ANALYSIS
+{
+    unsigned live = 0;
+    for (auto& queue : m_queues) {
+        for (auto& plan : queue)
+            live += minutemanRanSinceEnqueue(*plan);
+    }
+    TierUpExperts::noteLiveQueue(live);
+}
+
 CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
 {
     if (!Options::useConcurrentJIT()) {
@@ -318,6 +328,8 @@ CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
         }
     }
     m_queues[tier].append(WTF::move(plan));
+    if (TierUpExperts::orderingEnabled()) [[unlikely]]
+        minutemanNoteLiveQueue();
     wakeThreads(locker, tier);
     return CompilationResult::CompilationDeferred;
 }
@@ -402,6 +414,8 @@ bool JITWorklist::dequeuePlan(const AbstractLocker&, JITWorkerSlot& slot)
         // If the plan is canceled during compilation, the codeBlock may no longer be alive, so remember the plan's load now.
         slot.m_planLoad = planLoad(*slot.m_plan);
         m_ongoingCompilationsPerTier[i]++;
+        if (TierUpExperts::orderingEnabled()) [[unlikely]]
+            minutemanNoteLiveQueue();
         return true;
     }
     return false;

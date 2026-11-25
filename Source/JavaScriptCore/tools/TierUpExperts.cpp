@@ -223,6 +223,27 @@ HashMap<CodeBlock*, std::unique_ptr<EdgeState>>* s_edges;
 enum OrderExpert { OFifo, ONewest, OLoopBound, OSmallest, OCallerFirst, OGlobalArrival, OLiveFirst, OPageRank, NumOrderExperts };
 const char* const kOrderNames[NumOrderExperts] = { "fifo", "newest", "loop-bound", "smallest", "caller-first", "global-arrival", "live-first", "pagerank" };
 unsigned s_orderSelected { OFifo };
+// D52 ordering bandit (--tierUpOrderExpert=bandit): EXP3 (Auer et al. 2002) over the ordering
+// experts, one arm per 10 ms epoch; feedback from the acting arm only (CLAUDE.md exception).
+// Reward of an epoch with >= 1 ordering decision = 1 / (1 + mean number of waiting plans whose
+// function ran since enqueue), i.e. fewer live plans stuck in the queue is better. Anytime gamma_t
+// = min(1, sqrt(K ln K / ((e - 1) t))) (Auer et al., Cor. 3.2 with T = t). Fixed RNG seed.
+struct Bandit {
+    bool on { false };
+    double logW[NumOrderExperts] { };
+    double prob[NumOrderExperts] { };
+    uint64_t t { 0 };
+    MonotonicTime epochStart, lastEvent;
+    unsigned lastLive { 0 };
+    double area { 0 }; // live plans x ms in this epoch
+    uint64_t decisions { 0 };
+    uint64_t pulls[NumOrderExperts] { };
+    double rewardSum[NumOrderExperts] { };
+    uint64_t emptyEpochs { 0 };
+    uint32_t rng { 0x9e3779b9 };
+};
+Bandit s_bandit;
+static double banditUniform();
 // Linked call graph over baseline CodeBlocks (every link, independent of Supply's slots).
 HashMap<CodeBlock*, HashSet<CodeBlock*>>* s_callOut;
 HashMap<CodeBlock*, HashSet<CodeBlock*>>* s_callIn;
@@ -861,8 +882,63 @@ void priceAndReport() WTF_REQUIRES_LOCK(s_lock)
     dataLogLn();
 }
 
+// D52: the bandit's state (t, log weights) carries across runs in --tierUpOrderBanditState.
+static void banditSave()
+{
+    const char8_t* path = Options::tierUpOrderBanditState();
+    if (!s_bandit.on || !path)
+        return;
+    if (FILE* f = fopen(reinterpret_cast<const char*>(path), "w")) {
+        fprintf(f, "%llu", static_cast<unsigned long long>(s_bandit.t));
+        for (unsigned e = 0; e < NumOrderExperts; ++e)
+            fprintf(f, " %.17g", s_bandit.logW[e]);
+        fprintf(f, "\n");
+        fclose(f);
+    }
+}
+
+static void banditLoad()
+{
+    const char8_t* path = Options::tierUpOrderBanditState();
+    if (!path)
+        return;
+    FILE* f = fopen(reinterpret_cast<const char*>(path), "r");
+    if (!f)
+        return;
+    unsigned long long t = 0;
+    double w[NumOrderExperts];
+    bool ok = fscanf(f, "%llu", &t) == 1;
+    for (unsigned e = 0; e < NumOrderExperts && ok; ++e)
+        ok = fscanf(f, "%lg", &w[e]) == 1;
+    fclose(f);
+    if (!ok)
+        return;
+    s_bandit.t = t;
+    double maxW = w[0];
+    for (unsigned e = 0; e < NumOrderExperts; ++e) {
+        s_bandit.logW[e] = w[e];
+        maxW = std::max(maxW, w[e]);
+    }
+    constexpr unsigned K = static_cast<unsigned>(NumOrderExperts);
+    double gamma = t ? std::min(1.0, std::sqrt(K * std::log(K) / ((M_E - 1) * t))) : 1.0;
+    double sum = 0, x[K];
+    for (unsigned e = 0; e < K; ++e)
+        sum += (x[e] = std::exp(w[e] - maxW));
+    for (unsigned e = 0; e < K; ++e)
+        s_bandit.prob[e] = (1 - gamma) * x[e] / sum + gamma / K;
+    s_bandit.rng ^= static_cast<uint32_t>(t * 2654435761u); // a different draw sequence per run
+}
+
 void dump()
 {
+    {
+        static bool s_saved;
+        Locker locker { s_lock };
+        if (!s_saved) {
+            s_saved = true;
+            banditSave();
+        }
+    }
     if (Options::tierUpExpertsDumpWork()) {
         Locker locker { s_lock };
         for (auto& [function, st] : *s_fn) {
@@ -878,11 +954,17 @@ void dump()
     dataLogLn("tierUpExperts: selected tierUp=", kTierNames[s_tierSelected], " deopt=", kDeoptNames[s_deoptSelected],
         " mix=", static_cast<unsigned>(s_mix), " pulls=", s_stats.pulls, " quietGaps=", s_stats.quietGaps);
     if (g_orderEnabled) {
-        dataLogLn("tierUpExperts: order acting=", kOrderNames[s_orderSelected], " dps=", s_order.dps, " byTier=", s_order.dpsByTier[0], "/", s_order.dpsByTier[1], "/", s_order.dpsByTier[2],
+        dataLogLn("tierUpExperts: order acting=", s_bandit.on ? "bandit" : kOrderNames[s_orderSelected], " dps=", s_order.dps, " byTier=", s_order.dpsByTier[0], "/", s_order.dpsByTier[1], "/", s_order.dpsByTier[2],
             " graphNodesMax=", s_order.maxNodes, " candidates=", s_order.candidates, " loopEntry=", s_order.candLoop, " live=", s_order.candLive, " oldestLive=", s_order.firstLive, " rankComputes=", s_order.rankComputes, " rankMs=", s_order.rankMs);
         for (unsigned e = 0; e < NumOrderExperts; ++e)
             dataLogLn("tierUpExperts: order expert=", kOrderNames[e], " computed=", s_order.dps, " differsFromFifo=", s_order.differsFromFifo[e],
                 " agreesWithActed=", s_order.agreesWithActed[e], " pickedOtherTier=", s_order.pickedOtherTier[e]);
+    }
+    if (s_bandit.on) {
+        dataLog("tierUpExperts: bandit epochs=", s_bandit.t, " emptyEpochs=", s_bandit.emptyEpochs, " final=", kOrderNames[s_orderSelected]);
+        for (unsigned e = 0; e < NumOrderExperts; ++e)
+            dataLog(" ", kOrderNames[e], "=", s_bandit.pulls[e], "/", s_bandit.pulls[e] ? s_bandit.rewardSum[e] / s_bandit.pulls[e] : 0, "/p", s_bandit.prob[e]);
+        dataLogLn();
     }
     if (g_shadowEnabled) {
         scoreShadows(MonotonicTime::now(), true);
@@ -1173,6 +1255,23 @@ void initialize(VM& vm)
                 s_orderSelected = e;
                 known = true;
             }
+        }
+        if (is(o, "bandit")) {
+            s_bandit.on = true;
+            known = true;
+            for (unsigned e = 0; e < NumOrderExperts; ++e)
+                s_bandit.prob[e] = 1.0 / static_cast<unsigned>(NumOrderExperts);
+            banditLoad();
+            double u = banditUniform(), acc = 0;
+            s_orderSelected = NumOrderExperts - 1;
+            for (unsigned e = 0; e < NumOrderExperts; ++e) {
+                acc += s_bandit.prob[e];
+                if (u < acc) {
+                    s_orderSelected = e;
+                    break;
+                }
+            }
+            s_bandit.epochStart = s_bandit.lastEvent = MonotonicTime::now();
         }
         RELEASE_ASSERT_WITH_MESSAGE(known, "tierUpExperts: unknown --tierUpOrderExpert");
         s_callOut = new HashMap<CodeBlock*, HashSet<CodeBlock*>>();
@@ -2190,6 +2289,7 @@ unsigned orderPick(const Vector<OrderCandidate, 16>& c)
     Locker locker { s_lock };
     unsigned end = computeOrderPicks(c, pick);
     unsigned acted = pick[s_orderSelected];
+    s_bandit.decisions++;
     for (unsigned i = 0; i < end; ++i) {
         bool live = c[i].ranSinceEnqueue;
         s_order.candidates++;
@@ -2443,6 +2543,75 @@ void noteCounterVisit(CodeBlock* baseline, unsigned kind, double count, bool ent
     }
 }
 
+
+void noteLiveQueue(unsigned live)
+{
+    MonotonicTime now = MonotonicTime::now();
+    Locker locker { s_lock };
+    if (!s_bandit.on)
+        return;
+    s_bandit.area += s_bandit.lastLive * (now - s_bandit.lastEvent).milliseconds();
+    s_bandit.lastLive = live;
+    s_bandit.lastEvent = now;
+}
+
+namespace {
+static double banditUniform()
+{
+    // xorshift32 (Marsaglia 2003)
+    uint32_t& x = s_bandit.rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return (x >> 8) * (1.0 / 16777216.0);
+}
+
+} // anonymous namespace
+
+static void banditEpoch(MonotonicTime now)
+{
+    Bandit& b = s_bandit;
+    double epochMs = (now - b.epochStart).milliseconds();
+    if (epochMs < 10)
+        return;
+    b.area += b.lastLive * (now - b.lastEvent).milliseconds();
+    b.lastEvent = now;
+    constexpr unsigned K = static_cast<unsigned>(NumOrderExperts);
+    if (!b.decisions)
+        b.emptyEpochs++;
+    else {
+        unsigned arm = s_orderSelected;
+        double reward = 1.0 / (1.0 + b.area / epochMs);
+        b.pulls[arm]++;
+        b.rewardSum[arm] += reward;
+        b.t++;
+        double gamma = std::min(1.0, std::sqrt(K * std::log(K) / ((M_E - 1) * b.t)));
+        b.logW[arm] += gamma * (reward / b.prob[arm]) / K;
+        double maxW = b.logW[0];
+        for (unsigned e = 1; e < K; ++e)
+            maxW = std::max(maxW, b.logW[e]);
+        double sum = 0;
+        double w[K];
+        for (unsigned e = 0; e < K; ++e)
+            sum += (w[e] = std::exp(b.logW[e] - maxW));
+        for (unsigned e = 0; e < K; ++e)
+            b.prob[e] = (1 - gamma) * w[e] / sum + gamma / K;
+        double u = banditUniform(), acc = 0;
+        unsigned next = K - 1;
+        for (unsigned e = 0; e < K; ++e) {
+            acc += b.prob[e];
+            if (u < acc) {
+                next = e;
+                break;
+            }
+        }
+        s_orderSelected = next;
+    }
+    b.area = 0;
+    b.decisions = 0;
+    b.epochStart = now;
+}
+
 void noteDequeueOrder(unsigned tier, uint64_t arrival, unsigned hash)
 {
     Locker locker { s_lock };
@@ -2456,6 +2625,10 @@ void tick()
     if (g_shadowEnabled) {
         Locker locker { s_lock };
         scoreShadows(MonotonicTime::now(), false);
+    }
+    if (s_bandit.on) {
+        Locker locker { s_lock };
+        banditEpoch(MonotonicTime::now());
     }
     static MonotonicTime s_lastRank;
     static uint64_t s_rankedVersion { 0 };

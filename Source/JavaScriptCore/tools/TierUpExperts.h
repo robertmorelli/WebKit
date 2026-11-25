@@ -193,6 +193,8 @@ unsigned orderPick(const Vector<OrderCandidate, 16>&);
 void tick();
 // D50: one dequeue, in order (worklist lock held).
 void noteDequeueOrder(unsigned tier, uint64_t arrival, unsigned hash);
+// D52 bandit: number of queued plans whose function ran since enqueue, at each enqueue/dequeue.
+void noteLiveQueue(unsigned live);
 
 // ---- D51 shadow queues (--tierUpOrderShadow). Every ordering expert keeps its own copy of the
 // compile queue: same arrivals (shadowEnqueue), same service opportunities (each real dequeue is
