@@ -1286,8 +1286,8 @@ void initialize(VM& vm)
         }
     }
     g_enabled = true;
-    if (Options::verboseTierUpExperts())
-        std::atexit(dump);
+    if (Options::verboseTierUpExperts() || (s_bandit.on && Options::tierUpOrderBanditState()))
+        std::atexit(dump); // dump() saves the bandit state first, then prints only when verbose
 }
 
 void shutdown(VM& vm)
