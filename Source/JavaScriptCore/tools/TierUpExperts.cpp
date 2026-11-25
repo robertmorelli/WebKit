@@ -66,6 +66,7 @@ const char* const kDeoptNames[] = { "jsc-default", "refutation", "cause-split" }
 const char* const kDPNames[] = { "LLIntToBaseline", "BaselineToDFG", "BaselineLoopOSR", "DFGToFTL", "DFGLoopOSR", "Retier", "Exit", "LoopReoptimize" };
 
 unsigned s_tierSelected { TJsc };
+unsigned s_combine { 0 }; // D54: 0 none, 1 or, 2 and
 constexpr unsigned TMixer = NumTierExperts; // s_tierSelected value for the mixer
 uint8_t s_mix { 0xff };  // tier-up experts that compute votes (lean build: only the mix's)
 constexpr double kLearningRate = 0.45; // LeCaR's learning rate
@@ -1248,6 +1249,14 @@ void initialize(VM& vm)
     }
     RELEASE_ASSERT_WITH_MESSAGE(found, "tierUpExperts: unknown --deoptExpert");
     RELEASE_ASSERT_WITH_MESSAGE(Options::tierUpTimeAttribution(), "tierUpExperts: the experts need --tierUpTimeAttribution=1");
+    if (const char8_t* c = Options::tierUpExpertCombine()) {
+        if (is(c, "or"))
+            s_combine = 1;
+        else if (is(c, "and"))
+            s_combine = 2;
+        else
+            RELEASE_ASSERT_WITH_MESSAGE(false, "tierUpExperts: --tierUpExpertCombine must be or / and");
+    }
     if (const char8_t* o = Options::tierUpOrderExpert()) {
         bool known = false;
         for (unsigned e = 0; e < NumOrderExperts; ++e) {
@@ -1802,8 +1811,18 @@ bool tierUp(DP dp, CodeBlock* owner, bool jscGo)
                 if (acted != v[TJsc])
                     s_majorityOverrodeJsc++;
             }
-        } else
+        } else {
             acted = v[s_tierSelected] == Abstain ? v[TJsc] : v[s_tierSelected];
+            // D54 structural variants of the acting expert: act only at some decision points
+            // (--tierUpExpertStepMask, bit = DP index; 0 = all), and combine with JSC's own decision
+            // (--tierUpExpertCombine=or: go if either goes; and: go only if both go).
+            if (unsigned mask = Options::tierUpExpertStepMask(); mask && !(mask & (1u << dpi)))
+                acted = v[TJsc];
+            else if (s_combine == 1)
+                acted = (acted == Yes || v[TJsc] == Yes) ? Yes : No;
+            else if (s_combine == 2)
+                acted = (acted == Yes && v[TJsc] == Yes) ? Yes : No;
+        }
 
         if (isRetier) {
             unsigned r = static_cast<unsigned>(DP::Retier);
